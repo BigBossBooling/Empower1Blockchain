@@ -1,3 +1,5 @@
 cryptography
 requests
 click
+python-multibase
+python-multicodec

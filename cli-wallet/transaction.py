@@ -1,270 +1,390 @@
 import time
 import hashlib
-import json # Using JSON for hashing consistency. Could also use a library like `cbor2` or custom struct packing.
-from cryptography.hazmat.primitives import hashes as crypto_hashes # Renamed to avoid conflict
+import json
+import base64 # For encoding byte arrays in JSON for Go
+from cryptography.hazmat.primitives import hashes as crypto_hashes
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from wallet import CURVE # Import CURVE from wallet.py
+
+# Assuming wallet.py is in the same directory or PYTHONPATH
+from wallet import CURVE, load_private_key, get_public_key_bytes
+
+# Transaction Types (mirroring Go's core.TransactionType)
+TX_STANDARD = "standard"
+TX_CONTRACT_DEPLOY = "contract_deployment"
+TX_CONTRACT_CALL = "contract_call"
+# Note: A transaction *becomes* multi-sig by populating multi-sig fields,
+# TxType might still be standard, deploy, or call.
+
+class SignerInfo:
+    def __init__(self, public_key_hex: str, signature_hex: str):
+        self.public_key_hex = public_key_hex # Hex string of the signer's public key
+        self.signature_hex = signature_hex  # Hex string of the DER-encoded signature
+
+    def to_dict(self):
+        # For saving to pending tx file (human-readable hex)
+        return {
+            "publicKeyHex": self.public_key_hex,
+            "signatureHex": self.signature_hex,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(data['publicKeyHex'], data['signatureHex'])
 
 class Transaction:
-    def __init__(self, from_address_bytes, to_address_bytes, amount, fee=0, timestamp=None, public_key_bytes=None):
-        self.id = None # Will be hash of content
-        self.timestamp = timestamp if timestamp is not None else int(time.time() * 1_000_000_000) # Nanoseconds
-        self.from_address = from_address_bytes.hex() # Store as hex string, matching Go's ProposerAddress type if it's string
-        self.to_address = to_address_bytes.hex()   # Store as hex string
+    def __init__(self, from_address_hex: str, timestamp: int = None,
+                 # Standard tx fields
+                 to_address_hex: str = None, amount: int = 0, fee: int = 0,
+                 # Contract deploy
+                 contract_code_bytes: bytes = None,
+                 # Contract call
+                 target_contract_address_hex: str = None, function_name: str = None, arguments_bytes: bytes = None,
+                 # Single signer (if not multi-sig)
+                 public_key_hex: str = None,
+                 signature_hex: str = None,
+                 # Multi-sig fields
+                 required_signatures: int = 0,
+                 authorized_public_keys_hex: list[str] = None,
+                 signers: list[SignerInfo] = None,
+                 tx_type: str = TX_STANDARD,
+                 tx_id_hex: str = None
+                 ):
+
+        self.id_hex = tx_id_hex
+        self.timestamp = timestamp if timestamp is not None else int(time.time() * 1_000_000_000)
+
+        self.from_address_hex = from_address_hex
+
+        self.public_key_hex = public_key_hex
+        self.signature_hex = signature_hex
+
+        self.tx_type = tx_type
+
+        self.to_address_hex = to_address_hex
         self.amount = int(amount)
         self.fee = int(fee)
-        self.public_key = public_key_bytes.hex() if public_key_bytes else None # Sender's public key, hex encoded
-        self.signature = None # DER-encoded signature, hex string
+
+        self.contract_code_bytes = contract_code_bytes
+        self.target_contract_address_hex = target_contract_address_hex
+        self.function_name = function_name
+        self.arguments_bytes = arguments_bytes
+
+        self.required_signatures = int(required_signatures)
+        self.authorized_public_keys_hex = sorted(list(set(authorized_public_keys_hex))) if authorized_public_keys_hex else []
+        self.signers = signers if signers else []
 
     def __repr__(self):
-        return f"<Transaction id={self.id} from={self.from_address} to={self.to_address} amount={self.amount}>"
+        return (f"<Transaction id={self.id_hex} type='{self.tx_type}' from='{self.from_address_hex}' "
+                f"to='{self.to_address_hex}' amount={self.amount} "
+                f"multisigM={self.required_signatures} N={len(self.authorized_public_keys_hex)} signed={len(self.signers)} >")
 
-    def to_dict(self, for_signing=False):
-        """Returns a dictionary representation of the transaction."""
-        data = {
-            "Timestamp": self.timestamp,
-            "From": self.from_address, # In Go, these are []byte. For hashing, use bytes.
-            "To": self.to_address,
-            "Amount": self.amount,
-            "Fee": self.fee,
-            "PublicKey": self.public_key, # This is hex string of public key bytes
-        }
-        if not for_signing:
-            data["ID"] = self.id
-            data["Signature"] = self.signature
-        return data
-
-    def to_json_for_broadcast(self):
-        """ Prepares the transaction for sending to the Go node. Matches Go struct fields. """
-        if not self.id or not self.signature or not self.public_key:
-            raise ValueError("Transaction must be fully signed and ID'd before broadcasting.")
-
+    def to_dict_for_file(self) -> dict:
+        """Returns a dictionary representation suitable for saving to/loading from a JSON file."""
         return {
-            "ID": bytes.fromhex(self.id).decode('latin-1'), # Assuming Go expects []byte as string
-            "Timestamp": self.timestamp,
-            "From": bytes.fromhex(self.from_address).decode('latin-1'),
-            "To": bytes.fromhex(self.to_address).decode('latin-1'),
-            "Amount": self.amount,
-            "Fee": self.fee,
-            "Signature": bytes.fromhex(self.signature).decode('latin-1'),
-            "PublicKey": bytes.fromhex(self.public_key).decode('latin-1'),
+            "id_hex": self.id_hex,
+            "timestamp": self.timestamp,
+            "from_address_hex": self.from_address_hex, # This would be the multi-sig address/ID
+            "public_key_hex": self.public_key_hex, # Single-signer's pubkey (empty for multi-sig)
+            "signature_hex": self.signature_hex,   # Single-signer's signature (empty for multi-sig)
+            "tx_type": self.tx_type,
+            "to_address_hex": self.to_address_hex,
+            "amount": self.amount,
+            "fee": self.fee,
+            "contract_code_bytes_b64": base64.b64encode(self.contract_code_bytes).decode('utf-8') if self.contract_code_bytes else None,
+            "target_contract_address_hex": self.target_contract_address_hex,
+            "function_name": self.function_name,
+            "arguments_bytes_b64": base64.b64encode(self.arguments_bytes).decode('utf-8') if self.arguments_bytes else None,
+            "required_signatures": self.required_signatures,
+            "authorized_public_keys_hex": self.authorized_public_keys_hex, # Stored sorted
+            "signers": [signer.to_dict() for signer in self.signers],
         }
 
+    @classmethod
+    def from_dict_for_file(cls, data: dict):
+        """Creates a Transaction object from a dictionary (e.g., loaded from JSON file)."""
+        signers_list = [SignerInfo.from_dict(s_data) for s_data in data.get("signers", [])]
 
-    def data_for_hashing(self):
+        return cls(
+            tx_id_hex=data.get("id_hex"),
+            timestamp=data["timestamp"],
+            from_address_hex=data["from_address_hex"],
+            public_key_hex=data.get("public_key_hex"),
+            signature_hex=data.get("signature_hex"),
+            tx_type=data.get("tx_type", TX_STANDARD),
+            to_address_hex=data.get("to_address_hex"),
+            amount=data.get("amount", 0),
+            fee=data.get("fee", 0),
+            contract_code_bytes=base64.b64decode(data["contract_code_bytes_b64"]) if data.get("contract_code_bytes_b64") else None,
+            target_contract_address_hex=data.get("target_contract_address_hex"),
+            function_name=data.get("function_name"),
+            arguments_bytes=base64.b64decode(data["arguments_bytes_b64"]) if data.get("arguments_bytes_b64") else None,
+            required_signatures=data.get("required_signatures", 0),
+            authorized_public_keys_hex=data.get("authorized_public_keys_hex", []), # Assumes already sorted if from our own file
+            signers=signers_list
+        )
+
+    def data_for_hashing(self) -> bytes:
         """
         Prepares the transaction data for hashing.
-        Order and types must precisely match Go's `Transaction.prepareDataForHashing()`.
-        Go side uses gob encoding on a struct:
-        type TxDataForHashing struct {
-            Timestamp int64
-            From      []byte
-            To        []byte
-            Amount    uint64
-            Fee       uint64
-            PublicKey []byte
-        }
-        We need to replicate this structure and encoding as closely as possible.
-        Using JSON with ordered keys for simplicity here, but GOB or a strict binary format is safer.
-        For now, let's use a specific JSON string representation.
-        A better method would be to use a canonical serialization format.
-        Python's `struct` module or a library like `construct` could be used for precise binary packing.
-        Let's try to match the Go GOB structure by serializing a dictionary with the same field names.
-        The Go GOB encoder will likely output field names.
-
-        Given Go uses gob, and gob is not easily portable, a more robust approach is to define
-        a canonical JSON representation or a simple concatenation of fields in a defined order
-        and byte format (e.g., lengths prefixed or fixed size).
-
-        For now, let's use a simple, ordered JSON string representation for hashing.
-        This is a common simplification but has pitfalls if not perfectly matched.
-        The Go `Transaction.Hash()` uses gob encoding of `TxDataForHashing`.
-        This is tricky to replicate perfectly in Python without a shared schema or IDL.
-
-        Let's assume Go's TxDataForHashing for `Transaction.Hash()` is:
-        Timestamp (int64), From ([]byte), To ([]byte), Amount (uint64), Fee (uint64), PublicKey ([]byte)
-        Concatenated in order, with specific byte representations (e.g., BigEndian for numbers).
-        This is the most robust way if not using a cross-language serialization like Protobuf.
-
-        Simplification: For now, use JSON with sorted keys. This is NOT ideal for cross-language hashing.
-        A better approach is to define a byte string explicitly.
-        Let's try to build a byte string:
-        - Timestamp: 8 bytes, big-endian
-        - From: length-prefixed bytes
-        - To: length-prefixed bytes
-        - Amount: 8 bytes, big-endian
-        - Fee: 8 bytes, big-endian
-        - PublicKey: length-prefixed bytes
+        This MUST produce a JSON string with alphabetically sorted keys to match Go's TxDataForJSONHashing.
         """
-
-        # This data structure MUST match Go's TxDataForHashing for gob encoding
-        # For GOB compatibility, we'd need a Python GOB library or a very specific byte layout.
-        # Let's define a canonical JSON representation instead for cross-language hashing,
-        # assuming the Go side is also adjusted to hash this JSON representation.
-        # If Go side MUST use gob, this Python hash will not match.
-        #
-        # The Go code for Transaction.Hash() uses:
-        #   data := TxDataForHashing{ Timestamp, From, To, Amount, Fee, PublicKey }
-        #   gob.NewEncoder(&buf).Encode(data)
-        #   sha256.Sum256(buf.Bytes())
-        #
-        # This implies we need to make Python produce GOB compatible output for these fields.
-        # This is non-trivial.
-        #
-        # Alternative: Modify Go to hash a canonical JSON or byte string.
-        # For this exercise, we'll *assume* we can construct a byte string in Python
-        # that, when hashed, matches what the Go side would hash.
-        # This is a major simplification point for now.
-        #
-        # Let's assume a simpler canonical form for hashing for now:
-        # A JSON string with fields in a specific order.
-        # This is fragile. A byte-concatenation approach is better.
-
         payload_to_hash = {
-            "Timestamp": self.timestamp,
-            # From, To, PublicKey are hex strings in the object, convert to bytes for hashing
-            "From": self.from_address, # Hex string
-            "To": self.to_address,     # Hex string
-            "Amount": self.amount,
             "Fee": self.fee,
-            "PublicKey": self.public_key # Hex string
+            "From": self.from_address_hex,
+            "Timestamp": self.timestamp,
+            "TxType": self.tx_type,
         }
-        # Serialize to JSON string, ensure keys are sorted for consistency
-        # Ensure no spaces and use UTF-8
-        # This JSON string will be hashed. The Go side must do the equivalent.
+
+        # Single-signer public key (only if this is not a multi-sig where From is already the multi-sig ID)
+        if self.public_key_hex and self.required_signatures == 0:
+             payload_to_hash["PublicKey"] = self.public_key_hex
+
+        # Fields for specific transaction types
+        if self.tx_type == TX_STANDARD:
+            if self.to_address_hex is not None: payload_to_hash["To"] = self.to_address_hex
+            payload_to_hash["Amount"] = self.amount
+        elif self.tx_type == TX_CONTRACT_DEPLOY:
+            if self.contract_code_bytes is not None:
+                payload_to_hash["ContractCode"] = base64.b64encode(self.contract_code_bytes).decode('utf-8')
+            # Amount might be 0 for deployment, handled by omitempty in Go or explicit inclusion if needed.
+            payload_to_hash["Amount"] = self.amount # Amount can be 0
+        elif self.tx_type == TX_CONTRACT_CALL:
+            if self.target_contract_address_hex is not None:
+                payload_to_hash["TargetContractAddress"] = self.target_contract_address_hex
+            if self.function_name is not None: payload_to_hash["FunctionName"] = self.function_name
+            if self.arguments_bytes is not None:
+                payload_to_hash["Arguments"] = base64.b64encode(self.arguments_bytes).decode('utf-8')
+            payload_to_hash["Amount"] = self.amount # Amount can be value sent to contract
+
+        # Multi-signature configuration IS PART OF WHAT'S SIGNED
+        if self.required_signatures > 0 and len(self.authorized_public_keys_hex) > 0:
+            payload_to_hash["RequiredSignatures"] = self.required_signatures
+            # Ensure AuthorizedPublicKeys are sorted for canonical representation
+            payload_to_hash["AuthorizedPublicKeys"] = sorted(list(set(self.authorized_public_keys_hex)))
+
         json_string = json.dumps(payload_to_hash, sort_keys=True, separators=(',', ':'))
         return json_string.encode('utf-8')
 
-
-    def calculate_hash(self):
-        """Calculates the SHA256 hash of the transaction content for ID and signing."""
+    def calculate_hash(self) -> str:
+        """Calculates the SHA256 hash of the transaction content (hex string)."""
         data_to_hash = self.data_for_hashing()
         hasher = hashlib.sha256()
         hasher.update(data_to_hash)
-        return hasher.hexdigest() # Return as hex string
+        return hasher.hexdigest()
 
-    def sign(self, private_key_pem_path, password=None):
-        """Signs the transaction with the private key from the given wallet file."""
-        from wallet import load_private_key # Local import to avoid circular dependency if wallet uses Transaction
+    def sign_single(self, private_key_pem_path: str, password: str = None) -> bool:
+        """Signs a standard (non-multi-sig) transaction."""
+        if self.required_signatures > 0:
+            raise ValueError("Use 'add_signature' for multi-sig configured transactions.")
 
-        private_key = load_private_key(private_key_pem_path, password)
-
-        if self.public_key is None:
-            # Derive public key from private key if not set
-            public_key_obj = private_key.public_key()
-            self.public_key = public_key_obj.public_bytes(
-                encoding=Encoding.X962,
-                format=PublicFormat.UncompressedPoint
-            ).hex()
-
-        # Ensure self.from_address matches the public key of the signer
-        # This is implicitly handled if PublicKey is derived from the private key
-        # and From is set from PublicKey.
-        # Here, we assume self.from_address was set correctly at instantiation,
-        # or it should be updated now from private_key.public_key()
-        signer_public_key_bytes = private_key.public_key().public_bytes(
-            Encoding.X962, PublicFormat.UncompressedPoint
-        )
-        self.from_address = signer_public_key_bytes.hex()
-        self.public_key = self.from_address # From and PublicKey are the same for the sender
-
+        signing_key = load_private_key(private_key_pem_path, password)
+        self.public_key_hex = get_public_key_bytes(signing_key.public_key()).hex()
+        # For a single signer tx, From is their own public key address.
+        # This should have been set correctly in the constructor.
+        if self.from_address_hex != self.public_key_hex:
+             print(f"Warning: from_address_hex '{self.from_address_hex}' does not match signer's public_key_hex '{self.public_key_hex}'. Overwriting from_address_hex.")
+             self.from_address_hex = self.public_key_hex
 
         content_hash_hex = self.calculate_hash()
-        self.id = content_hash_hex # Set transaction ID
+        self.id_hex = content_hash_hex
 
         content_hash_bytes = bytes.fromhex(content_hash_hex)
-
-        # Sign the hash (bytes)
-        signature_bytes_der = private_key.sign(
+        signature_bytes_der = signing_key.sign(
             content_hash_bytes,
-            ec.ECDSA(utils.Prehashed(crypto_hashes.SHA256())) # Sign the pre-hashed data
+            ec.ECDSA(utils.Prehashed(crypto_hashes.SHA256()))
         )
-        self.signature = signature_bytes_der.hex() # Store signature as hex string
-
-        print(f"Signed transaction ID: {self.id}")
-        print(f"Signature (DER hex): {self.signature[:64]}...")
+        self.signature_hex = signature_bytes_der.hex()
         return True
 
-    def verify_signature_python(self):
-        """Verifies the transaction's signature (meant for Python-side verification if needed)."""
-        if not self.public_key or not self.signature:
-            raise ValueError("PublicKey and Signature must be present for verification.")
+    def add_signature(self, private_key_pem_path: str, password: str = None) -> bool:
+        """Adds a signature from one of the authorized signers to a multi-sig transaction."""
+        if not (self.required_signatures > 0 and len(self.authorized_public_keys_hex) > 0):
+            raise ValueError("Transaction is not configured for multi-signature (M and N keys required).")
 
-        public_key_bytes = bytes.fromhex(self.public_key)
-        signature_bytes = bytes.fromhex(self.signature)
+        signing_key = load_private_key(private_key_pem_path, password)
+        signer_public_key_hex = get_public_key_bytes(signing_key.public_key()).hex()
 
-        # Reconstruct public key object
-        # Assuming X962 uncompressed format from how public_key is stored
-        public_key = ec.EllipticCurvePublicKey.from_encoded_point(CURVE, public_key_bytes)
+        if signer_public_key_hex not in self.authorized_public_keys_hex:
+            raise ValueError(f"Signer's public key {signer_public_key_hex} is not in the authorized list.")
 
-        content_hash_hex = self.calculate_hash() # Recalculate hash of content
+        for s_info in self.signers:
+            if s_info.public_key_hex == signer_public_key_hex:
+                return True # Already signed by this key
+
+        content_hash_hex = self.calculate_hash()
+        if not self.id_hex:
+            self.id_hex = content_hash_hex
+        elif self.id_hex != content_hash_hex:
+            raise ValueError("Transaction content hash mismatch after initiation. Ensure base transaction data hasn't changed.")
+
+        content_hash_bytes = bytes.fromhex(content_hash_hex)
+        signature_bytes_der = signing_key.sign(
+            content_hash_bytes,
+            ec.ECDSA(utils.Prehashed(crypto_hashes.SHA256()))
+        )
+        signature_hex = signature_bytes_der.hex()
+
+        self.signers.append(SignerInfo(public_key_hex=signer_public_key_hex, signature_hex=signature_hex))
+        # Ensure signers are stored sorted by public key hex for deterministic order if needed later (e.g. for tx comparison)
+        self.signers.sort(key=lambda s: s.public_key_hex)
+        return True
+
+    def verify_signatures_python(self) -> bool:
+        """Verifies signatures for either single or multi-sig transactions (Python side)."""
+        content_hash_hex = self.calculate_hash()
+        if self.id_hex and self.id_hex != content_hash_hex:
+             pass
         content_hash_bytes = bytes.fromhex(content_hash_hex)
 
-        try:
-            public_key.verify(
-                signature_bytes,
-                content_hash_bytes,
-                ec.ECDSA(utils.Prehashed(crypto_hashes.SHA256()))
-            )
-            return True
-        except Exception: # cryptography.exceptions.InvalidSignature
-            return False
+        if self.required_signatures > 0: # Multi-sig
+            if len(self.signers) < self.required_signatures:
+                return False
+
+            valid_unique_signatures = 0
+            signed_pub_keys = set()
+            # Ensure authorized_public_keys_hex are sorted for verification consistency with how they might be stored or processed.
+            # The list itself should already be sorted from __init__ or loading.
+            # sorted_auth_keys_for_check = sorted(list(set(self.authorized_public_keys_hex)))
+
+
+            for signer_info in self.signers:
+                # Check if signer is authorized (using the potentially unsorted list from tx obj,
+                # as the key itself is what matters, not its position in an arbitrarily sorted list for this check)
+                if signer_info.public_key_hex not in self.authorized_public_keys_hex:
+                    return False
+                if signer_info.public_key_hex in signed_pub_keys:
+                    return False # Duplicate signer
+                try:
+                    pub_key_bytes = bytes.fromhex(signer_info.public_key_hex)
+                    pub_key_obj = ec.EllipticCurvePublicKey.from_encoded_point(CURVE, pub_key_bytes)
+                    sig_bytes = bytes.fromhex(signer_info.signature_hex)
+                    pub_key_obj.verify(
+                        sig_bytes, content_hash_bytes, ec.ECDSA(utils.Prehashed(crypto_hashes.SHA256()))
+                    )
+                    signed_pub_keys.add(signer_info.public_key_hex)
+                    valid_unique_signatures += 1
+                except Exception:
+                    return False
+
+            return valid_unique_signatures >= self.required_signatures
+
+        else: # Single-signer
+            if not self.public_key_hex or not self.signature_hex:
+                return False
+            try:
+                pub_key_bytes = bytes.fromhex(self.public_key_hex)
+                pub_key_obj = ec.EllipticCurvePublicKey.from_encoded_point(CURVE, pub_key_bytes)
+                sig_bytes = bytes.fromhex(self.signature_hex)
+                pub_key_obj.verify(
+                    sig_bytes, content_hash_bytes, ec.ECDSA(utils.Prehashed(crypto_hashes.SHA256()))
+                )
+                return True
+            except Exception:
+                return False
 
 # Example Usage (for testing this file directly)
 if __name__ == '__main__':
-    from wallet import generate_key_pair, public_key_to_address, get_public_key_bytes, save_private_key, load_private_key, CURVE
+    from wallet import generate_key_pair, public_key_to_address, get_public_key_bytes, save_private_key
     import os
 
     # Create dummy wallet files
-    sender_priv_key, sender_pub_key = generate_key_pair()
-    recipient_priv_key, recipient_pub_key = generate_key_pair() # Just for a valid recipient address
+    s_priv1, s_pub1 = generate_key_pair()
+    s_priv2, s_pub2 = generate_key_pair()
+    s_priv3, s_pub3 = generate_key_pair()
+    r_priv, r_pub = generate_key_pair() # Recipient
 
-    save_private_key(sender_priv_key, "tmp_sender_wallet.pem", "sender")
+    save_private_key(s_priv1, "tmp_signer1.pem", "p1")
+    save_private_key(s_priv2, "tmp_signer2.pem", "p2")
+    save_private_key(s_priv3, "tmp_signer3.pem", "p3")
 
-    sender_pub_bytes = get_public_key_bytes(sender_pub_key)
-    recipient_pub_bytes = get_public_key_bytes(recipient_pub_key)
+    s_pub1_hex = get_public_key_bytes(s_pub1).hex()
+    s_pub2_hex = get_public_key_bytes(s_pub2).hex()
+    s_pub3_hex = get_public_key_bytes(s_pub3).hex()
+    r_pub_hex = get_public_key_bytes(r_pub).hex()
 
-    # Create a transaction instance
-    tx = Transaction(
-        from_address_bytes=sender_pub_bytes,
-        to_address_bytes=recipient_pub_bytes,
+    print("--- Single Signer Transaction Test ---")
+    tx_single = Transaction(
+        from_address_hex=s_pub1_hex, # Will be re-set by sign_single to signer's pubkey
+        to_address_hex=r_pub_hex,
         amount=100,
-        fee=10,
-        public_key_bytes=sender_pub_bytes # Initially set based on from_address
+        fee=1,
+        tx_type=TX_STANDARD
+    )
+    tx_single.sign_single("tmp_signer1.pem", "p1")
+    print(f"Single-signer TX ID: {tx_single.id_hex}, Valid (Python): {tx_single.verify_signatures_python()}")
+    assert tx_single.verify_signatures_python()
+
+    print("\n--- Multi-Signature Transaction Test (2-of-3) ---")
+    auth_keys = [s_pub1_hex, s_pub2_hex, s_pub3_hex]
+    # Multi-sig address/ID (example, not strictly enforced by Transaction class itself)
+    from multisig import derive_multisig_address
+    multi_sig_id = derive_multisig_address(2, auth_keys)
+    print(f"Derived Multi-sig ID: {multi_sig_id}")
+
+    tx_multi = Transaction(
+        from_address_hex=multi_sig_id,
+        to_address_hex=r_pub_hex,
+        amount=200,
+        fee=2,
+        tx_type=TX_STANDARD, # A standard transfer, but authorized by multi-sig
+        required_signatures=2,
+        authorized_public_keys_hex=auth_keys
     )
 
-    print(f"Initial Transaction: {tx.to_dict()}")
-    print(f"Data for hashing: {tx.data_for_hashing().decode()}")
-
-    # Sign the transaction
-    tx.sign("tmp_sender_wallet.pem", "sender")
-    print(f"Signed Transaction: {tx.to_dict()}")
-
-    # Verify signature (Python side)
-    is_valid_python = tx.verify_signature_python()
-    print(f"Signature valid (Python check): {is_valid_python}")
-    assert is_valid_python
-
-    print("\nTransaction Test Complete.")
-    os.remove("tmp_sender_wallet.pem")
-
-    # Test case where public_key is not pre-set
-    tx_no_pub = Transaction(
-        from_address_bytes=sender_pub_bytes,
-        to_address_bytes=recipient_pub_bytes,
-        amount=50
-    )
-    save_private_key(sender_priv_key, "tmp_sender_wallet2.pem", "sender")
-    tx_no_pub.sign("tmp_sender_wallet2.pem", "sender")
-    assert tx_no_pub.public_key == sender_pub_bytes.hex()
-    print("Transaction signing with auto public key set: OK")
-    assert tx_no_pub.verify_signature_python()
-    os.remove("tmp_sender_wallet2.pem")
+    print(f"Initial multi-sig tx (unsigned): {tx_multi.to_dict_for_file()}")
+    # Hash before any signatures (should be stable)
+    initial_hash = tx_multi.calculate_hash()
+    tx_multi.id_hex = initial_hash # Set ID for pending tx
+    print(f"Initial hash for signing: {initial_hash}")
 
 
-    # Test a case where a different key tries to sign (should fail if implemented)
-    # or where `from_address` in constructor does not match signing key.
-    # Current `sign` method overwrites `from_address` and `public_key` with signer's info.
+    tx_multi.add_signature("tmp_signer1.pem", "p1")
+    self_hash_after_sig1 = tx_multi.calculate_hash()
+    assert initial_hash == self_hash_after_sig1 # Hash of content should not change by adding a signature
+    print(f"After 1st signature (Signer1: {s_pub1_hex[:10]}...), Signers: {len(tx_multi.signers)}")
+    self_valid1 = tx_multi.verify_signatures_python()
+    print(f"Valid after 1 signature (Python): {self_valid1} (expected False as M=2)")
+    assert not self_valid1 # Not enough signatures yet
 
-    print("All transaction.py tests passed.")
+    tx_multi.add_signature("tmp_signer2.pem", "p2")
+    self_hash_after_sig2 = tx_multi.calculate_hash()
+    assert initial_hash == self_hash_after_sig2
+    print(f"After 2nd signature (Signer2: {s_pub2_hex[:10]}...), Signers: {len(tx_multi.signers)}")
+    self_valid2 = tx_multi.verify_signatures_python()
+    print(f"Valid after 2 signatures (Python): {self_valid2} (expected True as M=2)")
+    assert self_valid2
+
+    # Try adding a signature from an unauthorized key (should fail)
+    unauth_priv, _ = generate_key_pair()
+    save_private_key(unauth_priv, "tmp_unauth.pem", "unauth")
+    try:
+        tx_multi.add_signature("tmp_unauth.pem", "unauth")
+        print("Error: Added signature from unauthorized key!")
+        assert False
+    except ValueError as e:
+        print(f"Correctly failed to add unauthorized signature: {e}")
+    os.remove("tmp_unauth.pem")
+
+
+    # Test saving and loading pending multi-sig tx
+    pending_tx_file = "tmp_pending_multisig.json"
+    with open(pending_tx_file, 'w') as f:
+        json.dump(tx_multi.to_dict_for_file(), f, indent=2)
+
+    with open(pending_tx_file, 'r') as f:
+        loaded_data = json.load(f)
+
+    loaded_tx_multi = Transaction.from_dict_for_file(loaded_data)
+    print(f"Loaded multi-sig TX ID: {loaded_tx_multi.id_hex}, Valid (Python): {loaded_tx_multi.verify_signatures_python()}")
+    assert loaded_tx_multi.id_hex == initial_hash
+    assert loaded_tx_multi.verify_signatures_python()
+    os.remove(pending_tx_file)
+
+
+    print("\nAll transaction.py multi-sig tests passed.")
+
+    # Clean up
+    os.remove("tmp_signer1.pem")
+    os.remove("tmp_signer2.pem")
+    os.remove("tmp_signer3.pem")

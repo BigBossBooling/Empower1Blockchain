@@ -1,0 +1,35 @@
+#!/bin/bash
+# Script to compile the simple_contract.ts to WASM using asc.
+# Uses npx to run the locally installed AssemblyScript compiler.
+
+# Output directory for the compiled WASM file (relative to this script's location)
+OUT_DIR="./out"
+mkdir -p $OUT_DIR
+
+# Source file
+SRC_FILE="simple_contract.ts"
+
+# Output WASM file path
+OUT_FILE="$OUT_DIR/simple_contract.wasm"
+
+echo "Compiling $SRC_FILE to $OUT_FILE using npx asc..."
+
+# Use npx to run the AssemblyScript compiler.
+# This assumes assemblyscript is listed in package.json (or installed locally).
+npx asc "$SRC_FILE" \
+    -b "$OUT_FILE" \
+    --optimize \
+    --runtime stub \
+    --exportRuntime \
+    # --noExportMemory \
+    # --initialMemory 1 \
+    # --maximumMemory 10 \
+    # --memoryBase <address>
+
+# Check if compilation was successful
+if [ $? -eq 0 ]; then
+  echo "Compilation successful: $OUT_FILE created."
+  ls -l "$OUT_FILE"
+else
+  echo "Compilation failed. Ensure 'assemblyscript' is installed locally (e.g., npm install assemblyscript --save-dev)."
+fi

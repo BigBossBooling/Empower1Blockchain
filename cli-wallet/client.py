@@ -54,16 +54,41 @@ def send_transaction(node_url: str, tx: Transaction) -> (bool, dict):
     }
 
     import base64
+    # Prepare payload for Go node, ensuring byte arrays are base64 encoded.
+    # Go's core.Transaction now has more fields.
     final_payload = {
-        "ID": base64.b64encode(bytes.fromhex(tx.id)).decode('utf-8'),
+        "ID": base64.b64encode(bytes.fromhex(tx.id_hex)).decode('utf-8') if tx.id_hex else None,
         "Timestamp": tx.timestamp,
         "From": base64.b64encode(bytes.fromhex(tx.from_address)).decode('utf-8'),
-        "To": base64.b64encode(bytes.fromhex(tx.to_address)).decode('utf-8'),
+
+        "PublicKey": base64.b64encode(bytes.fromhex(tx.public_key_hex)).decode('utf-8') if tx.public_key_hex else None,
+        "Signature": base64.b64encode(bytes.fromhex(tx.signature_hex)).decode('utf-8') if tx.signature_hex else None,
+
+        "TxType": tx.tx_type,
+
+        "To": base64.b64encode(bytes.fromhex(tx.to_address_hex)).decode('utf-8') if tx.to_address_hex else None,
         "Amount": tx.amount,
         "Fee": tx.fee,
-        "Signature": base64.b64encode(bytes.fromhex(tx.signature)).decode('utf-8'),
-        "PublicKey": base64.b64encode(bytes.fromhex(tx.public_key)).decode('utf-8'),
+
+        "ContractCode": base64.b64encode(tx.contract_code_bytes).decode('utf-8') if tx.contract_code_bytes else None,
+        "TargetContractAddress": base64.b64encode(bytes.fromhex(tx.target_contract_address_hex)).decode('utf-8') if tx.target_contract_address_hex else None,
+        "FunctionName": tx.function_name if tx.function_name else "", # Ensure empty string not None if Go expects string
+        "Arguments": base64.b64encode(tx.arguments_bytes).decode('utf-8') if tx.arguments_bytes else None,
+
+        "RequiredSignatures": tx.required_signatures if tx.required_signatures > 0 else 0, # Ensure 0 if not set
+        "AuthorizedPublicKeys": [base64.b64encode(bytes.fromhex(pk_hex)).decode('utf-8') for pk_hex in tx.authorized_public_keys_hex] if tx.authorized_public_keys_hex else [],
+        "Signers": [
+            {
+                "PublicKey": base64.b64encode(bytes.fromhex(s.public_key_hex)).decode('utf-8'),
+                "Signature": base64.b64encode(bytes.fromhex(s.signature_hex)).decode('utf-8')
+            } for s in tx.signers
+        ] if tx.signers else [],
     }
+    # Remove keys with None values if Go's omitempty is not sufficient or causes issues with empty strings vs nil
+    final_payload = {k: v for k, v in final_payload.items() if v is not None}
+    if "FunctionName" not in final_payload and tx.tx_type == TX_CONTRACT_CALL : # Ensure FunctionName is present for call, even if empty
+        final_payload["FunctionName"] = ""
+
 
     try:
         headers = {'Content-Type': 'application/json'}

@@ -73,10 +73,51 @@ python main.py create-transaction \
     --to <recipient_public_key_hex> \
     --amount <amount_to_send> \
     --fee 1 \
-    --node-url http://localhost:18080
+    --node-url http://localhost:18001
+    # (Adjust node_url to your node's HTTP RPC address, e.g., http://localhost:18001 if using default debug port for node 1)
 ```
-*(Note: The Go node's HTTP server for RPC (including /tx/submit) is started on the `--debug-listen` address, which defaults to `:18080` in the current `cmd/empower1d/main.go` configuration.)*
 
+**4. DID (Decentralized Identifier) Commands:**
+
+*   **Generate a `did:key` for a wallet:**
+    ```bash
+    python main.py did generate --wallet my_wallet.pem --password mypassword
+    ```
+    This will output the `did:key:...` string (e.g., `did:key:zQ3s...`) associated with the wallet's public key, constructed using multicodec `0x1201` and base58btc.
+
+*   **Register a DID Document (via `DIDRegistry` smart contract):**
+    First, ensure the `DIDRegistry` smart contract is deployed (see main project `TESTING.md` for instructions on deploying contracts like `did_registry.wasm`). Let its on-chain address be `<did_registry_contract_address>`.
+    You must use the wallet that corresponds to the DID you are registering.
+    ```bash
+    # Example:
+    # Assume 'did_owner_wallet.pem' generated '<owner_did_key_string>'
+    python main.py did register-document \
+        --wallet did_owner_wallet.pem --password didownerpass \
+        --did "<owner_did_key_string>" \
+        --doc-hash "your_document_sha256_hash" \
+        --doc-uri "ipfs://your_document_cid" \
+        --contract-address "<did_registry_contract_address>" \
+        --node-url http://localhost:18001 \
+        --fee 10
+    ```
+    This command:
+    1. Verifies that the `--did` string corresponds to the public key in `--wallet`.
+    2. Creates a contract call transaction targeting the `registerDIDDocument` function of the `DIDRegistry` contract.
+    3. The transaction is signed by the private key in `did_owner_wallet.pem`.
+    4. Submits the transaction to the node via the `/tx/submit` endpoint. The smart contract will then perform its own authentication by comparing the `did_string` with a `did:key` generated from the caller's public key (obtained via a host function).
+
+*   **Get DID Document Information (from `DIDRegistry` smart contract):**
+    ```bash
+    python main.py did get-info \
+        --did "<target_did_key_string>" \
+        --contract-address "<did_registry_contract_address>" \
+        --node-url http://localhost:18001
+    ```
+    This command calls the `getDIDDocumentInfo` function on the `DIDRegistry` contract.
+    *Currently, this CLI command uses the Go node's `/debug/call-contract` endpoint for simplicity, as `getDIDDocumentInfo` is a read-only query. This means it doesn't require a signing wallet or send a full on-chain transaction for this query.*
+    It will print the JSON string `"{ "document_hash": "...", "document_location_uri": "..." }"` or `null`.
+
+*(Note: The Go node's HTTP server for RPC and debug endpoints (like `/tx/submit`, `/debug/call-contract`) is typically run on the port specified by the `-debug-listen` flag, e.g., `:18001`, `:18002`.)*
 
 ## Development Notes
 
