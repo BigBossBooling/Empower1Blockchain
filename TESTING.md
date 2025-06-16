@@ -397,7 +397,108 @@ The `did_registry.wasm` contract allows registering and querying DID document in
 
 This provides a thorough test of the DID registration and resolution flow using the smart contract and CLI wallet.
 
-## VIII. Multi-Signature Transaction Testing (CLI Wallet & Node)
+## VIII. Micro-Lending DApp UI Testing
+
+This section describes how to set up and test the basic web UI for the `MicroLendingPool` smart contract. This UI uses the `empower1-js` SDK.
+
+**Prerequisites:**
+1.  An Empower1 node is running (e.g., Node 1 from Section II, with HTTP RPC on `:18001`).
+2.  The `MicroLendingPool.wasm` smart contract has been deployed to your running node. Note its contract address (`<lending_pool_contract_address>`). You can deploy it using the `/debug/deploy-contract` endpoint:
+    ```bash
+    # Assuming your node's debug HTTP endpoint is on localhost:18001
+    # And you have a deployer address <deployer_address_hex>
+    curl -X POST -H "Content-Type: application/json" \
+        -d '{"wasm_file_path": "contracts_src/micro_lending_pool/out/MicroLendingPool.wasm", "deployer_address": "<deployer_address_hex>"}' \
+        http://localhost:18001/debug/deploy-contract
+    ```
+3.  The `empower1-js` SDK files have been copied into `dapps/micro_lending_ui/js/lib/empower1-sdk/` as described in the DApp's README.
+    *   `wallet.js`
+    *   `transaction.js`
+    *   `rpc.js`
+    *   `index.js` (main SDK export)
+
+**Running the DApp UI:**
+
+1.  **Open `index.html`:** Navigate to the `dapps/micro_lending_ui/` directory and open the `index.html` file in a modern web browser.
+    *   **Note on `require` statements:** The `empower1-js` SDK uses `require()` for dependencies like `elliptic`, `axios`, etc. For these to work directly in the browser when `index.html` loads the SDK scripts, you might need to:
+        *   **Use a browser that has some experimental support for Node.js modules (unlikely for all dependencies).**
+        *   **Run a local web server and ensure the browser is configured to allow loading local modules if using ES6 module syntax (which the SDK is not currently using).**
+        *   **The simplest way for this non-bundled setup for testing might be to temporarily run the Electron main process from the `gui-wallet` (or a new minimal one) with `nodeIntegration: true` and point it to this DApp's `index.html`. This is NOT secure for production but can make `require()` work in the renderer for testing.**
+        *   Alternatively, the SDK files would need to be bundled into a single browser-compatible file using Webpack or Browserify.
+    *   For this test guide, we'll assume you can get the `index.html` and `app.js` to a state where `app.js` can access the SDK functions (e.g., by manually ensuring `elliptic`, `axios`, `js-sha256`, `buffer` are globally available or modifying SDK files to attach to `window`).
+
+**Testing Steps:**
+
+1.  **Connect to Node:**
+    *   The DApp UI should load. Enter the HTTP RPC URL of your node (e.g., `http://localhost:18001`) into the "Node URL" field.
+    *   Click "Connect to Node & Get Info".
+    *   **Observe:** The "Node Info" section should populate with data from your node. Status messages should indicate success.
+
+2.  **Load Wallet:**
+    *   Generate a wallet using the Python CLI (`python cli-wallet/main.py generate-wallet`) or use an existing one. Get its private key hex.
+    *   Paste the private key hex into the "Load with Private Key (Hex)" input field in the DApp UI.
+    *   Click "Load Wallet".
+    *   **Observe:** The "Current User Address" should update to display the wallet's public key hex.
+
+3.  **Set Contract Address:**
+    *   Paste the deployed `<lending_pool_contract_address>` into the "Contract Address" input field.
+
+4.  **Call `init()` on the `MicroLendingPool` contract (if not already called):**
+    *   This initializes the pool, often setting the owner. Use the `/debug/call-contract` endpoint via `curl` for this one-time setup if the DApp UI doesn't have a dedicated "Init Contract" button.
+    *   The transaction calling `init` must be signed by the intended owner of the pool.
+        ```bash
+        # Example: Assuming your loaded wallet in the DApp UI is the intended owner.
+        # The DApp UI currently doesn't have a generic "call init" button.
+        # You might need to add one or call it via the /debug/call-contract endpoint.
+        # For instance, if your loaded wallet (e.g., from sender_wallet.pem) should be owner:
+        # Use Python CLI to send the init transaction or use curl with debug endpoint.
+        # If using curl for debug call (owner is node's debug wallet):
+        curl -X POST -H "Content-Type: application/json" \
+            -d '{"contract_address": "<lending_pool_contract_address>", "function_name": "init", "arguments_json": "[]", "gas_limit": 1000000}' \
+            http://localhost:18001/debug/call-contract
+        ```
+    *   **Observe Node Logs:** For `MicroLendingPool contract initialized` and `Owner set to...` messages.
+
+5.  **Refresh Pool Data:**
+    *   Click "Refresh Pool Data".
+    *   **Observe:**
+        *   Node logs showing calls to `getPoolBalance` and `getUserInfo`.
+        *   The UI should update "Pool Balance", "Your Deposits", etc. (Note: `getUserInfo` currently returns a pointer/complex object; the UI might show "N/A (complex result)" until the Go debug endpoint or SDK properly decodes and returns the string/JSON from WASM for this).
+
+6.  **Deposit Funds:**
+    *   Enter an amount (e.g., 100) in the "Deposit Funds" section.
+    *   Click "Deposit".
+    *   **Observe:**
+        *   Status message indicating transaction submission.
+        *   Node logs showing the `/tx/submit` call, transaction processing, and contract logs from `deposit()` ("Deposited: 100 by user...").
+        *   After a short delay, click "Refresh Pool Data" again. "Pool Balance" and "Your Deposits" should update.
+
+7.  **Request Loan:**
+    *   Ensure the pool has enough funds (e.g., from other users' deposits or an initial funding if you modified the contract).
+    *   Enter an amount (e.g., 50) in the "Request Loan" section. Click "Request Loan".
+    *   **Observe:**
+        *   Status message. Node logs for `requestLoan()`.
+        *   Refresh pool data. "Your Loaned Amount" should update. "Pool Balance" should decrease.
+
+8.  **Repay Loan:**
+    *   Enter an amount (e.g., 50) in the "Repay Loan" section. Click "Repay Loan".
+    *   **Observe:**
+        *   Status message. Node logs for `repayLoan()`.
+        *   Refresh pool data. "Your Loaned Amount" should decrease/be zero. "Pool Balance" should increase. "Your Loan Repaid?" should update.
+
+9.  **Withdraw Funds:**
+    *   Enter an amount less than or equal to your deposited balance (e.g., 100) in the "Withdraw Funds" section.
+    *   Click "Withdraw".
+    *   **Observe:**
+        *   Status message. Node logs for `withdraw()`.
+        *   Refresh pool data. "Your Deposits" should decrease. "Pool Balance" should decrease.
+
+**Expected Outcome:**
+The DApp UI should allow users to perform the basic functions of the MicroLendingPool contract. Node logs will show contract interactions (especially logs from within the smart contract via `host_log_message`). Status messages in the UI should reflect the outcome of actions.
+
+This manual test verifies the SDK's ability to construct, sign, and send contract call transactions, and the node's ability to execute them via the VM and host functions.
+
+## IX. Multi-Signature Transaction Testing (CLI Wallet & Node)
 
 This section outlines manual steps to test the M-of-N multi-signature functionality. It assumes you have at least one Go node running (e.g., Node 1 from Section II, with HTTP RPC on `:18001`) and the Python CLI wallet is set up (Section III).
 

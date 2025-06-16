@@ -35,8 +35,11 @@ Empower1 is a learning project to build a simplified blockchain node from scratc
     *   A conceptual exploration of using K-Means clustering for anonymized "wealth" assessment based on potential blockchain activity patterns.
     *   Includes a Python script for offline analysis on mock, anonymized data.
     *   Documentation: [AI/ML Wealth Assessment Concept](docs/ai_ml_wealth_assessment.md)
+*   **Developer Experience:**
+    *   Comprehensive Smart Contract Development Guide: [Smart Contract Dev Guide](docs/smart_contract_dev_guide.md)
+    *   AssemblyScript Boilerplate: A template project to kickstart smart contract development, located in `contract_templates/assemblyscript_boilerplate/`.
 *   **Testing & Refinements:**
-    *   Expanded Go unit tests (core, crypto, mempool, multi-sig transactions).
+    *   Expanded Go unit tests (core, crypto, mempool, multi-sig transactions, DID crypto).
     *   Expanded Python CLI wallet unit tests (wallet, transactions, multi-sig, DID utils).
     *   Comprehensive manual testing guide (`TESTING.md`).
 

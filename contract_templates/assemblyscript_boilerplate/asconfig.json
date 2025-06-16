@@ -1,0 +1,31 @@
+{
+  "targets": {
+    "debug": {
+      "outFile": "build/debug/MyContract.wasm",
+      "sourceMap": true,
+      "debug": true,
+      "optimizeLevel": 0,
+      "shrinkLevel": 0,
+      "converge": false,
+      "noAssert": false
+    },
+    "release": {
+      "outFile": "build/release/MyContract.wasm",
+      "sourceMap": false,
+      "optimizeLevel": 3,
+      "shrinkLevel": 1,
+      "converge": true,
+      "noAssert": true
+    }
+  },
+  "options": {
+    "bindings": "esm",
+    "initialMemory": 2,
+    "maximumMemory": 10,
+    "runtime": "stub",
+    "exportRuntime": true,
+    "lib": ["assembly/env"],
+    "transform": ["@assemblyscript/transform-array-buffer"]
+  },
+  "extends": "assemblyscript/std/assembly.json"
+}

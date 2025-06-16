@@ -1,0 +1,24 @@
+{
+  "name": "empower1-as-contract-boilerplate",
+  "version": "0.1.0",
+  "description": "Boilerplate for Empower1 AssemblyScript Smart Contracts",
+  "type": "module",
+  "scripts": {
+    "asbuild:debug": "asc assembly/contracts/MyContract.ts --target debug -c asconfig.json",
+    "asbuild:release": "asc assembly/contracts/MyContract.ts --target release -c asconfig.json",
+    "asbuild": "npm run asbuild:release",
+    "test": "asp --config as-pect.config.js --verbose"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.27.24",
+    "@as-pect/cli": "^8.1.0",
+    "@as-pect/core": "^8.1.0",
+    "@assemblyscript/transform-array-buffer": "^0.27.24"
+  },
+  "exports": {
+    ".": {
+      "import": "./build/release/MyContract.js",
+      "types": "./build/release/MyContract.d.ts"
+    }
+  }
+}

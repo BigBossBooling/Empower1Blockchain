@@ -1,0 +1,25 @@
+{
+  "name": "empower1-gui-wallet",
+  "version": "0.1.0",
+  "description": "GUI Wallet for Empower1 Blockchain",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "empower1",
+    "blockchain",
+    "wallet",
+    "gui",
+    "electron"
+  ],
+  "author": "Empower1 Team",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0"
+  },
+  "dependencies": {
+    "elliptic": "^6.5.4"
+  }
+}
