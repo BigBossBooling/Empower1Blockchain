@@ -3,153 +3,226 @@ package p2p
 import (
 	"bytes"
 	"encoding/gob"
+	"errors" // Explicitly import errors
 	"fmt"
+	"log"    // For structured logging
+	"os"     // For log output (optional, as logger should be configured centrally)
+	"time"   // Added for potential timestamps in future messages
+	
+	"empower1.com/core/core" // Assuming 'core' is the package alias for empower1.com/core/core
+)
+
+// --- Custom Errors for P2P Message Handling ---
+var (
+	ErrMessageSerialization   = errors.New("failed to serialize p2p message")
+	ErrMessageDeserialization = errors.New("failed to deserialize p2p message")
+	ErrPayloadEncoding        = errors.New("failed to encode p2p payload")
+	ErrPayloadDecoding        = errors.New("failed to decode p2p payload")
+	ErrUnknownMessageType     = errors.New("unknown message type received")
+	ErrInvalidPayloadType     = errors.New("payload type mismatch for message")
 )
 
 // MessageType represents the type of a message in the P2P network.
+// These constants define the communication protocols between nodes.
 type MessageType byte
 
 const (
-	// MsgHello is sent by a node when it first connects to a peer.
-	MsgHello MessageType = iota
-	// MsgPeerList is sent to share known peers.
-	MsgPeerList
-	// MsgRequestPeerList is sent to request a list of known peers.
-	MsgRequestPeerList
-	// Consensus messages
-	MsgNewBlockProposal // Sent when a validator proposes a new block
-	MsgBlockVote        // Sent by validators to vote on a proposed block (rudimentary for now)
-	MsgNewTransaction   // Sent to broadcast a new transaction to the network
-	// Add other message types here as needed
+	// --- Handshake & Peer Discovery ---
+	MsgHello           MessageType = iota // Sent by a node when it first connects to a peer.
+	MsgPeerList                           // Sent to share known peers.
+	MsgRequestPeerList                    // Sent to request a list of known peers.
+
+	// --- Consensus & Chain Sync ---
+	MsgNewBlockProposal // Sent when a validator proposes a new block.
+	MsgBlockVote        // Sent by validators to vote on a proposed block (rudimentary for now).
+	MsgBlockRequest     // Sent to request a specific block by hash or height.
+	MsgBlockResponse    // Response to MsgBlockRequest, containing the block.
+
+	// --- Transaction Propagation ---
+	MsgNewTransaction // Sent to broadcast a new transaction to the network.
+
+	// --- EmPower1 Specific (Conceptual V2+) ---
+	MsgAILog          // Sent to broadcast AI/ML audit logs or related data.
+	MsgWealthUpdate   // Sent to signal significant wealth level updates for social mining (PoP).
 )
 
 // Message represents a generic message exchanged between peers.
+// This is the fundamental unit of communication across the network.
 type Message struct {
-	Type    MessageType
-	Payload []byte // Can be any gob-encodable structure, or raw bytes for simple messages
+	Type      MessageType // Type of message, indicates expected Payload content
+	Timestamp int64       // Message creation timestamp (for freshness checks, anti-replay)
+	SenderID  []byte      // ID of the sender (e.g., node ID or public key hash)
+	Payload   []byte      // Raw bytes of the gob-encoded specific payload struct
 }
 
 // --- Payload Structs ---
+// These define the specific data structures carried by different message types.
+// All payloads should be gob-encodable.
 
 // HelloPayload is the payload for a MsgHello message.
 type HelloPayload struct {
-	Version    string   // Protocol version
-	ListenAddr string   // The address this node is listening on, if any
-	KnownPeers []string // Peers known by the sender (network addresses)
+	Version      string   // Protocol version
+	ListenAddr   string   // The address this node is listening on, if any (e.g., "127.0.0.1:8080")
+	NodeID       []byte   // The cryptographic ID of the connecting node
+	KnownPeers   []string // Network addresses of peers known by the sender
+	CurrentHeight int64   // Sender's current blockchain height
 }
 
 // PeerListPayload is the payload for a MsgPeerList message.
 type PeerListPayload struct {
-	Peers []string // Network addresses of peers
+	Peers []string // Network addresses of peers (e.g., "1.2.3.4:8080")
 }
 
 // NewBlockProposalPayload is the payload for a MsgNewBlockProposal.
 type NewBlockProposalPayload struct {
-	BlockData []byte // Serialized core.Block
+	BlockData []byte // Gob-serialized core.Block
 }
 
-// BlockVotePayload is the payload for a MsgBlockVote. (Rudimentary)
+// BlockVotePayload is the payload for a MsgBlockVote. (Rudimentary PoS vote for V1)
 type BlockVotePayload struct {
-	BlockHash []byte
-	Validator string
-	Signature []byte
-	IsValid   bool
+	BlockHash []byte // Hash of the block being voted on
+	Validator []byte // Address of the voting validator
+	Signature []byte // Signature of the vote message
+	IsValid   bool   // True if the validator considers the block valid (for simple binary vote)
+	// V2+: VoteRound int64 // For multi-round consensus protocols
 }
 
 // NewTransactionPayload is the payload for MsgNewTransaction.
 type NewTransactionPayload struct {
-	TransactionData []byte // Serialized core.Transaction
+	TransactionData []byte // Gob-serialized core.Transaction
 }
 
+// BlockRequestPayload is the payload for MsgBlockRequest.
+type BlockRequestPayload struct {
+	BlockHash []byte // Request block by its hash
+	Height    int64  // Or request by height
+}
 
-// --- Serialization/Deserialization of Messages and Payloads ---
+// BlockResponsePayload is the payload for MsgBlockResponse.
+type BlockResponsePayload struct {
+	BlockData []byte // Gob-serialized core.Block
+}
+
+// --- Message Construction and Serialization/Deserialization ---
+
+// NewMessage creates a new generic Message.
+// This function helps in consistently creating messages before payload encoding.
+func NewMessage(msgType MessageType, senderID []byte, payload []byte) *Message {
+	return &Message{
+		Type:      msgType,
+		Timestamp: time.Now().UnixNano(),
+		SenderID:  senderID,
+		Payload:   payload,
+	}
+}
 
 // Serialize serializes a Message struct into a byte slice using gob.
+// This is the primary method for preparing messages for network transmission.
 func (m *Message) Serialize() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	if err := enc.Encode(m); err != nil {
-		return nil, fmt.Errorf("failed to gob encode message: %w", err)
+		return nil, fmt.Errorf("%w: message type %s, sender %x: %v", ErrMessageSerialization, m.Type.String(), m.SenderID, err)
 	}
 	return buf.Bytes(), nil
 }
 
 // DeserializeMessage deserializes a byte slice into a Message using gob.
+// This is the primary method for parsing incoming network messages.
 func DeserializeMessage(data []byte) (*Message, error) {
 	var msg Message
 	dec := gob.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&msg); err != nil {
-		return nil, fmt.Errorf("failed to gob decode message: %w", err)
+		return nil, fmt.Errorf("%w: failed to gob decode message: %v", ErrMessageDeserialization, err)
+	}
+	if msg.SenderID == nil || len(msg.SenderID) == 0 { // Basic validation
+		return nil, fmt.Errorf("%w: message missing sender ID", ErrMessageDeserialization)
 	}
 	return &msg, nil
 }
 
 // --- Payload Specific Serialization/Deserialization Helpers ---
-// It's often good practice to have these for type safety and clarity,
-// though for simple cases direct gob encoding/decoding of Message.Payload is also possible.
+// These functions provide type-safe encoding/decoding for message payloads,
+// enforcing "Know Your Core, Keep it Clear" for data types.
 
-// ToBytes serializes any gob-encodable payload to []byte.
-func ToBytes(payload interface{}) ([]byte, error) {
+// EncodePayload serializes any gob-encodable payload to []byte for inclusion in a Message.
+func EncodePayload(payload interface{}) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	if err := enc.Encode(payload); err != nil {
-		return nil, fmt.Errorf("failed to gob encode payload: %w", err)
+		return nil, fmt.Errorf("%w: failed to gob encode payload of type %T: %v", ErrPayloadEncoding, payload, err)
 	}
 	return buf.Bytes(), nil
 }
 
-// DeserializeHelloPayload deserializes bytes to HelloPayload.
+// DecodePayload deserializes raw payload bytes into a target payload struct.
+func DecodePayload(data []byte, target interface{}) error {
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(target); err != nil {
+		return fmt.Errorf("%w: failed to gob decode payload into type %T: %v", ErrPayloadDecoding, target, err)
+	}
+	return nil
+}
+
+// Helper specific deserializers for common payloads, for convenience and clarity.
 func DeserializeHelloPayload(data []byte) (*HelloPayload, error) {
 	var payload HelloPayload
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&payload); err != nil {
-		return nil, fmt.Errorf("failed to gob decode HelloPayload: %w", err)
+	if err := DecodePayload(data, &payload); err != nil {
+		return nil, fmt.Errorf("failed to decode HelloPayload: %w", err)
 	}
 	return &payload, nil
 }
 
-// DeserializePeerListPayload deserializes bytes to PeerListPayload.
 func DeserializePeerListPayload(data []byte) (*PeerListPayload, error) {
 	var payload PeerListPayload
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&payload); err != nil {
-		return nil, fmt.Errorf("failed to gob decode PeerListPayload: %w", err)
+	if err := DecodePayload(data, &payload); err != nil {
+		return nil, fmt.Errorf("failed to decode PeerListPayload: %w", err)
 	}
 	return &payload, nil
 }
 
-// DeserializeNewBlockProposalPayload deserializes bytes to NewBlockProposalPayload.
 func DeserializeNewBlockProposalPayload(data []byte) (*NewBlockProposalPayload, error) {
 	var payload NewBlockProposalPayload
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&payload); err != nil {
-		return nil, fmt.Errorf("failed to gob decode NewBlockProposalPayload: %w", err)
+	if err := DecodePayload(data, &payload); err != nil {
+		return nil, fmt.Errorf("failed to decode NewBlockProposalPayload: %w", err)
 	}
 	return &payload, nil
 }
 
-// DeserializeBlockVotePayload deserializes bytes to BlockVotePayload.
 func DeserializeBlockVotePayload(data []byte) (*BlockVotePayload, error) {
 	var payload BlockVotePayload
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&payload); err != nil {
-		return nil, fmt.Errorf("failed to gob decode BlockVotePayload: %w", err)
+	if err := DecodePayload(data, &payload); err != nil {
+		return nil, fmt.Errorf("failed to decode BlockVotePayload: %w", err)
 	}
 	return &payload, nil
 }
 
-// DeserializeNewTransactionPayload deserializes bytes to NewTransactionPayload.
 func DeserializeNewTransactionPayload(data []byte) (*NewTransactionPayload, error) {
 	var payload NewTransactionPayload
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&payload); err != nil {
-		return nil, fmt.Errorf("failed to gob decode NewTransactionPayload: %w", err)
+	if err := DecodePayload(data, &payload); err != nil {
+		return nil, fmt.Errorf("failed to decode NewTransactionPayload: %w", err)
 	}
 	return &payload, nil
 }
 
+func DeserializeBlockRequestPayload(data []byte) (*BlockRequestPayload, error) {
+	var payload BlockRequestPayload
+	if err := DecodePayload(data, &payload); err != nil {
+		return nil, fmt.Errorf("failed to decode BlockRequestPayload: %w", err)
+	}
+	return &payload, nil
+}
+
+func DeserializeBlockResponsePayload(data []byte) (*BlockResponsePayload, error) {
+	var payload BlockResponsePayload
+	if err := DecodePayload(data, &payload); err != nil {
+		return nil, fmt.Errorf("failed to decode BlockResponsePayload: %w", err)
+	}
+	return &payload, nil
+}
 
 // String returns a human-readable string for MessageType.
+// Useful for logging and debugging.
 func (mt MessageType) String() string {
 	switch mt {
 	case MsgHello:
@@ -164,22 +237,34 @@ func (mt MessageType) String() string {
 		return "BLOCK_VOTE"
 	case MsgNewTransaction:
 		return "NEW_TRANSACTION"
+	case MsgBlockRequest:
+		return "BLOCK_REQUEST"
+	case MsgBlockResponse:
+		return "BLOCK_RESPONSE"
+	case MsgAILog: // EmPower1 specific
+		return "AI_LOG"
+	case MsgWealthUpdate: // EmPower1 specific
+		return "WEALTH_UPDATE"
 	default:
 		return fmt.Sprintf("UNKNOWN_MSG_TYPE(%d)", mt)
 	}
 }
 
-// GobRegisterTypes should be called in an init() function in the main package
-// (or any package that uses these types with gob encoding where ambiguity might occur,
-// especially if interfaces are used for payloads).
-// For now, we handle specific typed payloads, reducing direct need for gob.Register
-// unless interfaces are used as the direct type for Message.Payload in gob.Encode/Decode.
-// func GobRegisterTypes() {
-//    gob.Register(&core.Block{}) // If core.Block is ever sent directly
-//    gob.Register(&core.Transaction{}) // If core.Transaction is ever sent directly
-//    gob.Register(HelloPayload{})
-//    gob.Register(PeerListPayload{})
-//    gob.Register(NewBlockProposalPayload{})
-//    gob.Register(BlockVotePayload{})
-//    gob.Register(NewTransactionPayload{})
-// }
+// GobRegisterTypes should be called once at application startup (e.g., in main.go init function).
+// This is essential for gob to correctly encode/decode interface types or pointer types
+// that are sent via Message.Payload. Without registration, gob might panic during deserialization.
+func GobRegisterTypes() {
+	gob.Register(&core.Block{})
+	gob.Register(&core.Transaction{})
+	gob.Register(&HelloPayload{})
+	gob.Register(&PeerListPayload{})
+	gob.Register(&NewBlockProposalPayload{})
+	gob.Register(&BlockVotePayload{})
+	gob.Register(&NewTransactionPayload{})
+	gob.Register(&BlockRequestPayload{})
+	gob.Register(&BlockResponsePayload{})
+	// EmPower1 specific payload types (if any)
+	// gob.Register(&AILogPayload{})
+	// gob.Register(&WealthUpdatePayload{})
+	log.Println("P2P: GOB types registered.")
+}
