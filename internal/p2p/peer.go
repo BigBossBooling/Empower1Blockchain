@@ -1,24 +1,23 @@
 package p2p
 
 import (
-	"fmt"
+	"errors"
 	"net"
 	"sync"
 	"time" // Added for potential last activity timestamp for peer health
-
-	"empower1.com/core/core" // Assuming this has relevant types if needed for peer ID
+	// Assuming this has relevant types if needed for peer ID
 )
 
 // Peer represents a connected node in the EmPower1 P2P network.
 // It encapsulates the network connection and state relevant to that peer.
 type Peer struct {
-	conn        net.Conn           // The underlying network connection
-	id          []byte             // Cryptographic ID of the peer (e.g., public key hash of the remote node)
-	address     string             // Network address of the peer (e.g., "127.0.0.1:8080")
-	mu          sync.RWMutex       // Mutex for protecting concurrent access to mutable peer state
-	knownPeers  map[string]bool    // Tracks peers known by *this* peer (addresses string)
-	isInitiator bool               // True if our node initiated the connection to this peer
-	lastActivity time.Time         // Timestamp of the last received message from this peer (for liveness checks)
+	conn         net.Conn        // The underlying network connection
+	id           []byte          // Cryptographic ID of the peer (e.g., public key hash of the remote node)
+	address      string          // Network address of the peer (e.g., "127.0.0.1:8080")
+	mu           sync.RWMutex    // Mutex for protecting concurrent access to mutable peer state
+	knownPeers   map[string]bool // Tracks peers known by *this* peer (addresses string)
+	isInitiator  bool            // True if our node initiated the connection to this peer
+	lastActivity time.Time       // Timestamp of the last received message from this peer (for liveness checks)
 	// V2+: ReputationScore float64 // Reputation of this peer (e.g., for routing or trust)
 	// V2+: Latency        time.Duration // Measured network latency to this peer
 	// V2+: ProtocolVersion string     // The protocol version supported by this peer
@@ -35,11 +34,11 @@ func NewPeer(conn net.Conn, isInitiator bool, peerID []byte) (*Peer, error) {
 	}
 
 	return &Peer{
-		conn:        conn,
-		id:          peerID,
-		address:     conn.RemoteAddr().String(),
-		knownPeers:  make(map[string]bool),
-		isInitiator: isInitiator,
+		conn:         conn,
+		id:           peerID,
+		address:      conn.RemoteAddr().String(),
+		knownPeers:   make(map[string]bool),
+		isInitiator:  isInitiator,
 		lastActivity: time.Now(), // Initialize with current time
 	}, nil
 }

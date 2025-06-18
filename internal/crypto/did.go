@@ -1,118 +1,187 @@
-package crypto
+package consensus
 
 import (
-	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"errors" // Explicitly import errors
-	"fmt"
-	"strings"
-
-	"github.com/multiformats/go-multibase"
-	"github.com/multiformats/go-multicodec"
+    "bytes"
+    "context"
+    "empower1.com/core/core"
+    "errors"
+    "fmt"
+    "log"
+    "os"
+    "sync"
+    "sync/atomic"
+    "time"
 )
 
-// --- Custom Errors for Crypto Package ---
 var (
-	ErrInvalidPublicKeyFormat = errors.New("invalid public key format")
-	ErrUnsupportedCurve       = errors.New("unsupported elliptic curve")
-	ErrDIDKeyFormat           = errors.New("invalid did:key string format")
-	ErrMultibaseDecode        = errors.New("failed to decode multibase string")
-	ErrUnexpectedEncoding     = errors.New("unexpected multibase encoding")
-	ErrMulticodecRead         = errors.New("failed to read multicodec code")
-	ErrUnexpectedMulticodec   = errors.New("unexpected multicodec type")
-	ErrPubKeyLengthMismatch   = errors.New("public key length mismatch after decoding")
+    ErrEngineAlreadyRunning  = errors.New("consensus engine is already running")
+    ErrEngineNotRunning      = errors.New("consensus engine is not running")
+    ErrInvalidEngineConfig   = errors.New("invalid consensus engine configuration")
+    ErrFailedToGetLastBlock  = errors.New("failed to get last block from blockchain")
+    ErrFailedToGetProposer   = errors.New("failed to get proposer for height")
+    ErrProposeBlockFailed    = errors.New("failed to propose block")
+    ErrIncomingBlockInvalid  = errors.New("incoming block is invalid")
+    ErrFailedToAddBlock      = errors.New("failed to add block to blockchain")
 )
 
-// CodecSecp256r1PubKeyUncompressed defines the multicodec for uncompressed P-256 public keys.
-// This ensures standard, interoperable encoding for did:key identifiers.
-const CodecSecp256r1PubKeyUncompressed multicodec.Code = 0x1201
-
-// GenerateDIDKeySecp256r1 generates a 'did:key' identifier for an uncompressed P-256 public key.
-// This is a core function for the Decentralized Identity (DID) System of EmPower1.
-// Adheres to "Sense the Landscape, Secure the Solution".
-func GenerateDIDKeySecp256r1(pubKeyBytes []byte) (string, error) {
-	// Validate input public key format: uncompressed P-256 keys are 65 bytes (0x04 || X || Y)
-	if len(pubKeyBytes) != 65 || pubKeyBytes[0] != 0x04 {
-		return "", fmt.Errorf("%w: expected 65 bytes starting with 0x04 for uncompressed P-256, got %d bytes", ErrInvalidPublicKeyFormat, len(pubKeyBytes))
-	}
-
-	// 1. Prepend the multicodec prefix (varint representation of the code).
-	// This makes the encoded data self-describing for the public key type.
-	codecHeaderBytes := multicodec.Header(CodecSecp256r1PubKeyUncompressed)
-
-	var prefixedPubKeyBuf bytes.Buffer
-	prefixedPubKeyBuf.Write(codecHeaderBytes)
-	prefixedPubKeyBuf.Write(pubKeyBytes)
-
-	// 2. Encode the multicodec-prefixed bytes using multibase (Base58BTC is standard for did:key).
-	// The 'z' prefix in Base58BTC indicates Base58BTC encoding.
-	didKeyMultibasePart, err := multibase.Encode(multibase.Base58BTC, prefixedPubKeyBuf.Bytes())
-	if err != nil {
-		return "", fmt.Errorf("%w: failed to encode public key with Base58BTC: %v", ErrMultibaseDecode, err)
-	}
-
-	// 3. Prepend the 'did:key:' prefix to form the final DID.
-	return "did:key:" + didKeyMultibasePart, nil
+type SimulatedNetwork interface {
+    BroadcastBlock(block *core.Block) error
+    ReceiveBlocks() <-chan *core.Block
 }
 
-// GenerateDIDKeyFromECDSAPublicKey generates a 'did:key' identifier from an ECDSA public key.
-// It ensures the key is P256 and converts it to uncompressed bytes before calling GenerateDIDKeySecp256r1.
-func GenerateDIDKeyFromECDSAPublicKey(pubKey *ecdsa.PublicKey) (string, error) {
-	if pubKey == nil {
-		return "", fmt.Errorf("%w: public key cannot be nil", ErrInvalidPublicKeyFormat)
-	}
-	// Ensure the curve is P256, as specified by the multicodec.
-	if pubKey.Curve != elliptic.P256() {
-		return "", fmt.Errorf("%w: public key must use P256 curve, got %s", ErrUnsupportedCurve, pubKey.Curve.Params().Name)
-	}
-	// Marshal the public key to its uncompressed byte representation (65 bytes, starts with 0x04).
-	uncompressedPubKeyBytes := elliptic.Marshal(elliptic.P256(), pubKey.X, pubKey.Y)
-	
-	// Delegate to the byte-based generation function.
-	return GenerateDIDKeySecp256r1(uncompressedPubKeyBytes)
+type ConsensusEngine struct {
+    validatorAddress  string
+    isValidator       bool
+    proposerService   *ProposerService
+    validationService *ValidationService
+    consensusState    *ConsensusState
+    blockchain        *core.Blockchain
+    network           SimulatedNetwork
+
+    ctx       context.Context
+    cancel    context.CancelFunc
+    wg        sync.WaitGroup
+    logger    *log.Logger
+    isRunning atomic.Bool
+    startOnce sync.Once
+    stopOnce  sync.Once
 }
 
-// ParseDIDKeySecp256r1 parses a 'did:key' identifier back into an uncompressed P-256 public key byte slice.
-// This is crucial for verifying the identity associated with a DID.
-func ParseDIDKeySecp256r1(didKeyString string) ([]byte, error) {
-	// 1. Validate 'did:key:' prefix.
-	if !strings.HasPrefix(didKeyString, "did:key:") {
-		return nil, ErrDIDKeyFormat
-	}
-	multibasePart := strings.TrimPrefix(didKeyString, "did:key:")
+func NewConsensusEngine(
+    validatorAddress string,
+    proposerService *ProposerService,
+    validationService *ValidationService,
+    consensusState *ConsensusState,
+    blockchain *core.Blockchain,
+    network SimulatedNetwork,
+) (*ConsensusEngine, error) {
+    if proposerService == nil || validationService == nil || consensusState == nil || blockchain == nil || network == nil {
+        return nil, fmt.Errorf("%w: all core services must be provided", ErrInvalidEngineConfig)
+    }
+    isValidator := (proposerService != nil && proposerService.validatorAddress == validatorAddress)
+    logger := log.New(os.Stdout, "CONSENSUS_ENGINE: ", log.Ldate|log.Ltime|log.Lshortfile)
+    ctx, cancel := context.WithCancel(context.Background())
 
-	// 2. Decode the multibase part.
-	encoding, decodedBytesWithCodec, err := multibase.Decode(multibasePart)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMultibaseDecode, err)
-	}
-	if encoding != multibase.Base58BTC {
-		return nil, fmt.Errorf("%w: expected Base58BTC ('z') encoding, got %s ('%c')", ErrUnexpectedEncoding, multibase.EncodingToStr[encoding], encoding)
-	}
+    engine := &ConsensusEngine{
+        validatorAddress:  validatorAddress,
+        isValidator:       isValidator,
+        proposerService:   proposerService,
+        validationService: validationService,
+        consensusState:    consensusState,
+        blockchain:        blockchain,
+        network:           network,
+        logger:            logger,
+        ctx:               ctx,
+        cancel:            cancel,
+    }
+    engine.logger.Println("ConsensusEngine initialized.")
+    return engine, nil
+}
 
-	// 3. Consume the multicodec prefix to get the raw public key bytes.
-	codec, remainingBytes, err := multicodec.Consume(decodedBytesWithCodec)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMulticodecRead, err)
-	}
+func (ce *ConsensusEngine) Start() error {
+    var err error
+    ce.startOnce.Do(func() {
+        if ce.isRunning.Load() {
+            err = ErrEngineAlreadyRunning
+            return
+        }
+        ce.isRunning.Store(true)
+        ce.wg.Add(2)
+        go ce.startEngineLoop()
+        go ce.processIncomingBlocks()
+        ce.logger.Println("ConsensusEngine started.")
+    })
+    return err
+}
 
-	// 4. Validate the multicodec type.
-	if multicodec.Code(codec) != CodecSecp256r1PubKeyUncompressed {
-		return nil, fmt.Errorf("%w: expected %s (0x%x), got %s (0x%x)",
-			ErrUnexpectedMulticodec, CodecSecp256r1PubKeyUncompressed.String(), uint64(CodecSecp256r1PubKeyUncompressed),
-			multicodec.Code(codec).String(), uint64(codec))
-	}
+func (ce *ConsensusEngine) Stop() error {
+    var err error
+    ce.stopOnce.Do(func() {
+        if !ce.isRunning.Load() {
+            err = ErrEngineNotRunning
+            return
+        }
+        ce.cancel()
+        ce.wg.Wait()
+        ce.isRunning.Store(false)
+        ce.logger.Println("ConsensusEngine stopped.")
+    })
+    return err
+}
 
-	pubKeyBytes := remainingBytes
+func (ce *ConsensusEngine) startEngineLoop() {
+    defer ce.wg.Done()
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
 
-	// 5. Final validation of the public key byte slice.
-	if len(pubKeyBytes) != 65 {
-		return nil, fmt.Errorf("%w: expected 65 bytes, got %d", ErrPubKeyLengthMismatch, len(pubKeyBytes))
-	}
-	if pubKeyBytes[0] != 0x04 { // 0x04 indicates uncompressed point
-		return nil, fmt.Errorf("%w: decoded public key is not in uncompressed P-256 format (missing 0x04 prefix)", ErrInvalidPublicKeyFormat)
-	}
+    ce.logger.Println("Engine loop started.")
 
-	return pubKeyBytes, nil
+    for {
+        select {
+        case <-ce.ctx.Done():
+            ce.logger.Println("Engine loop received stop signal.")
+            return
+        case <-ticker.C:
+            currentChainHeight := ce.blockchain.ChainHeight()
+            if currentChainHeight == -1 {
+                ce.logger.Println("Blockchain is empty, waiting for genesis block to sync or be created.")
+                continue
+            }
+            nextBlockHeight := currentChainHeight + 1
+            expectedProposer, err := ce.consensusState.GetProposerForHeight(nextBlockHeight)
+            if err != nil {
+                ce.logger.Printf("Failed to get proposer for height %d: %v", nextBlockHeight, err)
+                continue
+            }
+            if ce.isValidator && bytes.Equal([]byte(ce.validatorAddress), expectedProposer.Address) {
+                ce.logger.Printf("It's OUR turn to propose block #%d!", nextBlockHeight)
+                if err := ce.proposeBlock(nextBlockHeight); err != nil {
+                    ce.logger.Printf("Failed to propose block #%d: %v", nextBlockHeight, err)
+                }
+            }
+        }
+    }
+}
+
+func (ce *ConsensusEngine) proposeBlock(height int64) error {
+    lastBlock, err := ce.blockchain.GetLastBlock()
+    if err != nil {
+        return fmt.Errorf("%w: %v", ErrFailedToGetLastBlock, err)
+    }
+    proposal, err := ce.proposerService.CreateProposalBlock(height, lastBlock.Hash, lastBlock.Timestamp)
+    if err != nil {
+        return fmt.Errorf("%w: %v", ErrProposeBlockFailed, err)
+    }
+    if err := ce.network.BroadcastBlock(proposal); err != nil {
+        return fmt.Errorf("failed to broadcast proposed block %d: %w", height, err)
+    }
+    ce.logger.Printf("Proposed and broadcasted block #%d (%x).", proposal.Height, proposal.Hash)
+    return nil
+}
+
+func (ce *ConsensusEngine) processIncomingBlocks() {
+    defer ce.wg.Done()
+    ce.logger.Println("Incoming block processor started.")
+
+    for {
+        select {
+        case <-ce.ctx.Done():
+            ce.logger.Println("Incoming block processor received stop signal.")
+            return
+        case incomingBlock := <-ce.network.ReceiveBlocks():
+            ce.logger.Printf("Received block #%d (%x) from network. Proposer: %x",
+                incomingBlock.Height, incomingBlock.Hash, incomingBlock.ProposerAddress)
+            if err := ce.validationService.ValidateBlock(incomingBlock); err != nil {
+                ce.logger.Printf("Incoming block #%d (%x) is INVALID: %v", incomingBlock.Height, incomingBlock.Hash, err)
+                continue
+            }
+            if err := ce.blockchain.AddBlock(incomingBlock); err != nil {
+                ce.logger.Printf("Failed to add validated block #%d (%x) to blockchain: %v", incomingBlock.Height, incomingBlock.Hash, err)
+                continue
+            }
+            if err := ce.consensusState.UpdateHeight(incomingBlock.Height); err != nil {
+                ce.logger.Printf("Failed to update consensus state height after adding block %d: %v", incomingBlock.Height, err)
+            }
+        }
+    }
 }

@@ -2,24 +2,28 @@ package consensus
 
 import (
 	"bytes"
-	"empower1.com/core/core" // Assuming 'core' is the package alias for empower1.com/core/core
+	"context"
 	"errors"
 	"fmt"
-	"log" // For structured logging
-	"os"   // For log output
+	"log"
+	"os"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"empower1.com/core/core"
 )
 
 // --- Custom Errors for ConsensusEngine ---
 var (
-	ErrEngineAlreadyRunning  = errors.New("consensus engine is already running")
-	ErrEngineNotRunning      = errors.New("consensus engine is not running")
-	ErrInvalidEngineConfig   = errors.New("invalid consensus engine configuration")
-	ErrFailedToGetLastBlock  = errors.New("failed to get last block from blockchain")
-	ErrFailedToGetProposer   = errors.New("failed to get proposer for height")
-	ErrProposeBlockFailed    = errors.New("failed to propose block")
-	ErrIncomingBlockInvalid  = errors.New("incoming block is invalid")
-	ErrFailedToAddBlock      = errors.New("failed to add block to blockchain")
+	ErrEngineAlreadyRunning = errors.New("consensus engine is already running")
+	ErrEngineNotRunning     = errors.New("consensus engine is not running")
+	ErrInvalidEngineConfig  = errors.New("invalid consensus engine configuration")
+	ErrFailedToGetLastBlock = errors.New("failed to get last block from blockchain")
+	ErrFailedToGetProposer  = errors.New("failed to get proposer for height")
+	ErrProposeBlockFailed   = errors.New("failed to propose block")
+	ErrIncomingBlockInvalid = errors.New("incoming block is invalid")
+	ErrFailedToAddBlock     = errors.New("failed to add block to blockchain")
 )
 
 // SimulatedNetwork defines an interface for conceptual network interactions.
@@ -32,18 +36,21 @@ type SimulatedNetwork interface {
 // ConsensusEngine orchestrates the PoS consensus process.
 // It manages block proposal, validation, and chain synchronization.
 type ConsensusEngine struct {
-	validatorAddress string            // Address of *this* node's validator (empty if not a validator)
-	isValidator      bool              // True if this node is configured as a validator
-	proposerService  *ProposerService  // Service to create new blocks
+	validatorAddress  string             // Address of *this* node's validator (empty if not a validator)
+	isValidator       bool               // True if this node is configured as a validator
+	proposerService   *ProposerService   // Service to create new blocks
 	validationService *ValidationService // Service to validate incoming blocks
-	consensusState   *ConsensusState   // Current state of consensus (height, validator set, schedule)
-	blockchain       *core.Blockchain  // The main blockchain instance
-	network          SimulatedNetwork  // Conceptual network interface
-	
-	stopChan         chan struct{}     // Channel to signal engine shutdown
-	isRunning        bool              // Flag to track engine's running status
-	wg               sync.WaitGroup    // WaitGroup for goroutines
-	logger           *log.Logger       // Dedicated logger for the engine
+	consensusState    *ConsensusState    // Current state of consensus (height, validator set, schedule)
+	blockchain        *core.Blockchain   // The main blockchain instance
+	network           SimulatedNetwork   // Conceptual network interface
+
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	logger    *log.Logger
+	isRunning atomic.Bool
+	startOnce sync.Once
+	stopOnce  sync.Once
 }
 
 // NewConsensusEngine creates a new ConsensusEngine instance.
@@ -59,12 +66,13 @@ func NewConsensusEngine(
 	if proposerService == nil || validationService == nil || consensusState == nil || blockchain == nil || network == nil {
 		return nil, fmt.Errorf("%w: all core services must be provided", ErrInvalidEngineConfig)
 	}
-	
+
 	// Determine if this node is a validator based on if a proposer service is provided for its address.
 	// In a real system, it would check if validatorAddress is in the active validator set.
-	isValidator := (proposerService != nil && proposerService.validatorAddress == validatorAddress) 
-	
+	isValidator := (proposerService != nil && proposerService.validatorAddress == validatorAddress)
+
 	logger := log.New(os.Stdout, "CONSENSUS_ENGINE: ", log.Ldate|log.Ltime|log.Lshortfile)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	engine := &ConsensusEngine{
 		validatorAddress:  validatorAddress,
@@ -75,8 +83,8 @@ func NewConsensusEngine(
 		blockchain:        blockchain,
 		network:           network,
 		logger:            logger,
-		stopChan:          make(chan struct{}),
-		isRunning:         false,
+		ctx:               ctx,
+		cancel:            cancel,
 	}
 	engine.logger.Println("ConsensusEngine initialized.")
 	return engine, nil
@@ -85,35 +93,41 @@ func NewConsensusEngine(
 // Start initiates the consensus engine's operation.
 // It starts goroutines for block proposal and incoming block processing.
 func (ce *ConsensusEngine) Start() error {
-	ce.wg.Add(1) // Add for StartEngineLoop
-	go ce.startEngineLoop()
-
-	// In a real application, you'd also start goroutines to listen for P2P messages (blocks, transactions, votes).
-	// For this conceptual stage, we'll assume `network.ReceiveBlocks()` represents that.
-	ce.wg.Add(1) // Add for ProcessIncomingBlocks
-	go ce.processIncomingBlocks()
-
-	ce.isRunning = true
-	ce.logger.Println("ConsensusEngine started.")
-	return nil
+	var err error
+	ce.startOnce.Do(func() {
+		if ce.isRunning.Load() {
+			err = ErrEngineAlreadyRunning
+			return
+		}
+		ce.isRunning.Store(true)
+		ce.wg.Add(2)
+		go ce.startEngineLoop()
+		go ce.processIncomingBlocks()
+		ce.logger.Println("ConsensusEngine started.")
+	})
+	return err
 }
 
 // Stop gracefully shuts down the consensus engine.
 func (ce *ConsensusEngine) Stop() error {
-	if !ce.isRunning {
-		return ErrEngineNotRunning
-	}
-	close(ce.stopChan) // Signal goroutines to stop
-	ce.wg.Wait()       // Wait for all goroutines to finish
-	ce.isRunning = false
-	ce.logger.Println("ConsensusEngine stopped.")
-	return nil
+	var err error
+	ce.stopOnce.Do(func() {
+		if !ce.isRunning.Load() {
+			err = ErrEngineNotRunning
+			return
+		}
+		ce.cancel()
+		ce.wg.Wait()
+		ce.isRunning.Store(false)
+		ce.logger.Println("ConsensusEngine stopped.")
+	})
+	return err
 }
 
 // startEngineLoop is the main loop for the consensus engine.
 // It continuously checks if it's this node's turn to propose a block.
 func (ce *ConsensusEngine) startEngineLoop() {
-	defer ce.wg.Done() // Ensure WaitGroup counter is decremented on exit
+	defer ce.wg.Done()                        // Ensure WaitGroup counter is decremented on exit
 	ticker := time.NewTicker(1 * time.Second) // Check every second if it's proposer turn
 	defer ticker.Stop()
 
@@ -121,24 +135,24 @@ func (ce *ConsensusEngine) startEngineLoop() {
 
 	for {
 		select {
-		case <-ce.stopChan:
+		case <-ce.ctx.Done():
 			ce.logger.Println("Engine loop received stop signal.")
 			return
 		case <-ticker.C:
 			// Ensure ConsensusState is updated with latest chain height
 			currentChainHeight := ce.blockchain.ChainHeight()
 			if currentChainHeight == -1 {
-				ce.logger.Debug("Blockchain is empty, waiting for genesis block to sync or be created.")
+				ce.logger.Println("Blockchain is empty, waiting for genesis block to sync or be created.")
 				continue // Cannot propose without a chain
 			}
 
 			// Propose for the NEXT block height
-			nextBlockHeight := currentChainHeight + 1 
-			
+			nextBlockHeight := currentChainHeight + 1
+
 			// Get expected proposer for the next height
 			expectedProposer, err := ce.consensusState.GetProposerForHeight(nextBlockHeight)
 			if err != nil {
-				ce.logger.Errorf("Failed to get proposer for height %d: %v", nextBlockHeight, err)
+				ce.logger.Printf("Failed to get proposer for height %d: %v", nextBlockHeight, err)
 				continue
 			}
 
@@ -146,7 +160,7 @@ func (ce *ConsensusEngine) startEngineLoop() {
 			if ce.isValidator && bytes.Equal([]byte(ce.validatorAddress), expectedProposer.Address) { // Address is []byte now
 				ce.logger.Printf("It's OUR turn to propose block #%d!", nextBlockHeight)
 				if err := ce.proposeBlock(nextBlockHeight); err != nil {
-					ce.logger.Errorf("Failed to propose block #%d: %v", nextBlockHeight, err)
+					ce.logger.Printf("Failed to propose block #%d: %v", nextBlockHeight, err)
 				}
 			}
 		}
@@ -180,11 +194,11 @@ func (ce *ConsensusEngine) processIncomingBlocks() {
 
 	for {
 		select {
-		case <-ce.stopChan:
+		case <-ce.ctx.Done():
 			ce.logger.Println("Incoming block processor received stop signal.")
 			return
 		case incomingBlock := <-ce.network.ReceiveBlocks(): // Receive block from conceptual network
-			ce.logger.Printf("Received block #%d (%x) from network. Proposer: %x", 
+			ce.logger.Printf("Received block #%d (%x) from network. Proposer: %x",
 				incomingBlock.Height, incomingBlock.Hash, incomingBlock.ProposerAddress)
 
 			// Validate the incoming block

@@ -1,16 +1,15 @@
 package vm
 
 import (
-	"bytes"
 	"encoding/hex" // Added for logging addresses/keys
-	"errors"
 	"fmt"
 	"log"
+	"os"
 	"time" // For mock timestamp in stub
 
 	"github.com/wasmerio/wasmer-go/wasmer"
 
-	"empower1.com/core/core"    // For Transaction types, Block (if needed)
+	// For Transaction types, Block (if needed)
 	"empower1.com/core/crypto" // For cryptographic utilities like GenerateDIDKey, PublicKeyBytesToAddress
 	"empower1.com/core/state"  // For state.State interaction
 )
@@ -45,7 +44,7 @@ func NewHostFunctionEnvironment(contractAddr, callerPubKey []byte, gasTank *GasT
 	if state == nil {
 		return nil, fmt.Errorf("%w: state manager cannot be nil", ErrInvalidHostEnv)
 	}
-	
+
 	logger := log.New(os.Stdout, "HOST_FN: ", log.Ldate|log.Ltime|log.Lshortfile) // Specific logger for host functions
 	return &HostFunctionEnvironment{
 		ContractAddress: contractAddr,
@@ -451,43 +450,48 @@ func BlockchainGenerateDidKey(env interface{}, args []wasmer.Value) ([]wasmer.Va
 	return []wasmer.Value{wasmer.NewI32(actualLen)}, nil // Return actual length of the DID string
 }
 
-
 // BlockchainEmitEvent (env.blockchain_emit_event) - For contracts to emit custom events to the blockchain.
 // Parameters: topic_ptr (i32), topic_len (i32), data_ptr (i32), data_len (i32)
 // Results: none
 func BlockchainEmitEvent(env interface{}, args []wasmer.Value) ([]wasmer.Value, error) {
-    hostEnv := env.(*HostFunctionEnvironment)
-    if hostEnv.Memory == nil { return nil, fmt.Errorf("%w: host memory not available for event emission", ErrInvalidHostEnv) }
+	hostEnv := env.(*HostFunctionEnvironment)
+	if hostEnv.Memory == nil {
+		return nil, fmt.Errorf("%w: host memory not available for event emission", ErrInvalidHostEnv)
+	}
 
-    const gasCostBase = 50 // Base cost for emitting an event
-    if err := hostEnv.GasTank.ConsumeGas(gasCostBase); err != nil { return []wasmer.Value{}, err }
+	const gasCostBase = 50 // Base cost for emitting an event
+	if err := hostEnv.GasTank.ConsumeGas(gasCostBase); err != nil {
+		return []wasmer.Value{}, err
+	}
 
-    topicPtr, topicLen := args[0].I32(), args[1].I32()
-    dataPtr, dataLen := args[2].I32(), args[3].I32()
-    wasmMemoryData := hostEnv.Memory.Data()
+	topicPtr, topicLen := args[0].I32(), args[1].I32()
+	dataPtr, dataLen := args[2].I32(), args[3].I32()
+	wasmMemoryData := hostEnv.Memory.Data()
 
-    // Validate memory access for topic and data
-    if topicPtr < 0 || topicLen < 0 || int64(topicPtr)+int64(topicLen) > int64(len(wasmMemoryData)) ||
-        dataPtr < 0 || dataLen < 0 || int64(dataPtr)+int64(dataLen) > int64(len(wasmMemoryData)) {
-        hostEnv.Logger.Errorf("VM_HOST_ERR: BlockchainEmitEvent: invalid memory access for contract %x", hostEnv.ContractAddress)
-        return nil, fmt.Errorf("%w: memory access out of bounds in host_emit_event", ErrCodeInvalidMemoryAccess)
-    }
+	// Validate memory access for topic and data
+	if topicPtr < 0 || topicLen < 0 || int64(topicPtr)+int64(topicLen) > int64(len(wasmMemoryData)) ||
+		dataPtr < 0 || dataLen < 0 || int64(dataPtr)+int64(dataLen) > int64(len(wasmMemoryData)) {
+		hostEnv.Logger.Errorf("VM_HOST_ERR: BlockchainEmitEvent: invalid memory access for contract %x", hostEnv.ContractAddress)
+		return nil, fmt.Errorf("%w: memory access out of bounds in host_emit_event", ErrCodeInvalidMemoryAccess)
+	}
 
-    gasCostBytes := uint64(topicLen + dataLen) // Gas based on event size
-    if err := hostEnv.GasTank.ConsumeGas(gasCostBytes); err != nil { return []wasmer.Value{}, err }
+	gasCostBytes := uint64(topicLen + dataLen) // Gas based on event size
+	if err := hostEnv.GasTank.ConsumeGas(gasCostBytes); err != nil {
+		return []wasmer.Value{}, err
+	}
 
-    topic := string(wasmMemoryData[topicPtr : topicPtr+topicLen])
-    eventData := wasmMemoryData[dataPtr : dataPtr+dataLen] // Raw bytes for data, not necessarily string
-    
-    // TODO: Actually emit event to a blockchain event bus or state manager for logging/indexing
-    hostEnv.Logger.Printf("CONTRACT_EVENT (Addr: %x): Topic: '%s', Data: %x\n", hostEnv.ContractAddress, topic, eventData)
-    return []wasmer.Value{}, nil
+	topic := string(wasmMemoryData[topicPtr : topicPtr+topicLen])
+	eventData := wasmMemoryData[dataPtr : dataPtr+dataLen] // Raw bytes for data, not necessarily string
+
+	// TODO: Actually emit event to a blockchain event bus or state manager for logging/indexing
+	hostEnv.Logger.Printf("CONTRACT_EVENT (Addr: %x): Topic: '%s', Data: %x\n", hostEnv.ContractAddress, topic, eventData)
+	return []wasmer.Value{}, nil
 }
 
 // Helper for min in GetStorage, if not already globally available
 func min(a, b int32) int32 {
-    if a < b {
-        return a
-    }
-    return b
+	if a < b {
+		return a
+	}
+	return b
 }

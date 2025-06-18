@@ -1,100 +1,187 @@
-package core
+package consensus
 
 import (
-	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic" // For P256 curve
-	"crypto/rand"
-	"crypto/sha256" // Potentially used for address derivation if more complex than raw pubkey
-	"encoding/binary"
-	"encoding/hex" // Used for hex encoding of addresses/keys for display/comparison
-	"errors"
-	"fmt"
-	"sort"
+    "bytes"
+    "context"
+    "empower1.com/core/core"
+    "errors"
+    "fmt"
+    "log"
+    "os"
+    "sync"
+    "sync/atomic"
+    "time"
 )
 
-// --- General Utility Functions ---
+var (
+    ErrEngineAlreadyRunning  = errors.New("consensus engine is already running")
+    ErrEngineNotRunning      = errors.New("consensus engine is not running")
+    ErrInvalidEngineConfig   = errors.New("invalid consensus engine configuration")
+    ErrFailedToGetLastBlock  = errors.New("failed to get last block from blockchain")
+    ErrFailedToGetProposer   = errors.New("failed to get proposer for height")
+    ErrProposeBlockFailed    = errors.New("failed to propose block")
+    ErrIncomingBlockInvalid  = errors.New("incoming block is invalid")
+    ErrFailedToAddBlock      = errors.New("failed to add block to blockchain")
+)
 
-// encodeInt64 converts an int64 to a byte slice using binary.BigEndian encoding.
-// This is crucial for consistent byte representation of numeric values across the network,
-// ensuring cryptographic integrity and deterministic hashing.
-func encodeInt64(num int64) []byte {
-	buf := new(bytes.Buffer)
-	// binary.Write should not return an error for fixed-size types like int64
-	err := binary.Write(buf, binary.BigEndian, num)
-	if err != nil {
-		// Log and panic only if absolutely unrecoverable, or return error for handling upstream
-		// In a production blockchain, this would likely be an unrecoverable serialization error.
-		panic(fmt.Sprintf("CORE_UTIL_PANIC: failed to encode int64: %v", err)) // Provide more context for panic
-	}
-	return buf.Bytes()
+type SimulatedNetwork interface {
+    BroadcastBlock(block *core.Block) error
+    ReceiveBlocks() <-chan *core.Block
 }
 
-// decodeInt64 decodes a byte slice into an int64 using binary.BigEndian encoding.
-// This is the inverse of encodeInt64, crucial for deserializing numeric values from blocks/transactions.
-func decodeInt64(data []byte) (int64, error) {
-	var num int64
-	buf := bytes.NewReader(data)
-	err := binary.Read(buf, binary.BigEndian, &num)
-	if err != nil {
-		return 0, fmt.Errorf("failed to decode int64: %w", err)
-	}
-	return num, nil
+type ConsensusEngine struct {
+    validatorAddress  string
+    isValidator       bool
+    proposerService   *ProposerService
+    validationService *ValidationService
+    consensusState    *ConsensusState
+    blockchain        *core.Blockchain
+    network           SimulatedNetwork
+
+    ctx       context.Context
+    cancel    context.CancelFunc
+    wg        sync.WaitGroup
+    logger    *log.Logger
+    isRunning atomic.Bool
+    startOnce sync.Once
+    stopOnce  sync.Once
 }
 
-// SortByteSlices sorts a slice of byte slices lexicographically.
-// This is critical for achieving canonical representation in data structures (e.g., for multi-signature schemes' authorized public keys).
-// Canonicalization ensures that identical data always produces the same hash, regardless of original order.
-func SortByteSlices(slices [][]byte) {
-	sort.Slice(slices, func(i, j int) bool { return bytes.Compare(slices[i], slices[j]) < 0 })
+func NewConsensusEngine(
+    validatorAddress string,
+    proposerService *ProposerService,
+    validationService *ValidationService,
+    consensusState *ConsensusState,
+    blockchain *core.Blockchain,
+    network SimulatedNetwork,
+) (*ConsensusEngine, error) {
+    if proposerService == nil || validationService == nil || consensusState == nil || blockchain == nil || network == nil {
+        return nil, fmt.Errorf("%w: all core services must be provided", ErrInvalidEngineConfig)
+    }
+    isValidator := (proposerService != nil && proposerService.validatorAddress == validatorAddress)
+    logger := log.New(os.Stdout, "CONSENSUS_ENGINE: ", log.Ldate|log.Ltime|log.Lshortfile)
+    ctx, cancel := context.WithCancel(context.Background())
+
+    engine := &ConsensusEngine{
+        validatorAddress:  validatorAddress,
+        isValidator:       isValidator,
+        proposerService:   proposerService,
+        validationService: validationService,
+        consensusState:    consensusState,
+        blockchain:        blockchain,
+        network:           network,
+        logger:            logger,
+        ctx:               ctx,
+        cancel:            cancel,
+    }
+    engine.logger.Println("ConsensusEngine initialized.")
+    return engine, nil
 }
 
-// --- Cryptographic & Address Utility Functions ---
-// These functions are fundamental for key management and address derivation in EmPower1.
-
-// GenerateKeyPairECDSA generates a new ECDSA private/public key pair using the P256 elliptic curve.
-// This is the standard curve used in many modern blockchain and security applications.
-func GenerateKeyPairECDSA() (*ecdsa.PrivateKey, error) {
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate ECDSA key pair: %w", err)
-	}
-	return privKey, nil
+func (ce *ConsensusEngine) Start() error {
+    var err error
+    ce.startOnce.Do(func() {
+        if ce.isRunning.Load() {
+            err = ErrEngineAlreadyRunning
+            return
+        }
+        ce.isRunning.Store(true)
+        ce.wg.Add(2)
+        go ce.startEngineLoop()
+        go ce.processIncomingBlocks()
+        ce.logger.Println("ConsensusEngine started.")
+    })
+    return err
 }
 
-// PublicKeyToAddress derives a simplified address from an ECDSA public key.
-// IMPORTANT: In a real EmPower1 production blockchain, this would involve
-// a more robust hashing scheme (e.g., SHA256 then RIPEMD160) and adding a version byte
-// and checksum to create a human-readable, error-checked address string.
-// For now, it uses the raw marshaled public key bytes as the address.
-func PublicKeyToAddress(pubKey *ecdsa.PublicKey) []byte {
-	// Marshaling the public key to bytes gives a compressed or uncompressed point representation.
-	// This serves as a unique identifier for now.
-	return elliptic.Marshal(pubKey.Curve, pubKey.X, pubKey.Y)
+func (ce *ConsensusEngine) Stop() error {
+    var err error
+    ce.stopOnce.Do(func() {
+        if !ce.isRunning.Load() {
+            err = ErrEngineNotRunning
+            return
+        }
+        ce.cancel()
+        ce.wg.Wait()
+        ce.isRunning.Store(false)
+        ce.logger.Println("ConsensusEngine stopped.")
+    })
+    return err
 }
 
-// AddressFromPubKeyBytes (conceptual) reconstructs an ECDSA PublicKey from raw marshaled public key bytes.
-// This is the inverse of PublicKeyToAddress for this simplified address scheme.
-func AddressFromPubKeyBytes(addrBytes []byte) (*ecdsa.PublicKey, error) {
-	x, y := elliptic.Unmarshal(elliptic.P256(), addrBytes)
-	if x == nil || y == nil { // Unmarshal returns nil X,Y if data is not a valid point on the curve
-		return nil, errors.New("failed to unmarshal public key from address bytes or invalid point")
-	}
-	return &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}, nil
+func (ce *ConsensusEngine) startEngineLoop() {
+    defer ce.wg.Done()
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+
+    ce.logger.Println("Engine loop started.")
+
+    for {
+        select {
+        case <-ce.ctx.Done():
+            ce.logger.Println("Engine loop received stop signal.")
+            return
+        case <-ticker.C:
+            currentChainHeight := ce.blockchain.ChainHeight()
+            if currentChainHeight == -1 {
+                ce.logger.Println("Blockchain is empty, waiting for genesis block to sync or be created.")
+                continue
+            }
+            nextBlockHeight := currentChainHeight + 1
+            expectedProposer, err := ce.consensusState.GetProposerForHeight(nextBlockHeight)
+            if err != nil {
+                ce.logger.Printf("Failed to get proposer for height %d: %v", nextBlockHeight, err)
+                continue
+            }
+            if ce.isValidator && bytes.Equal([]byte(ce.validatorAddress), expectedProposer.Address) {
+                ce.logger.Printf("It's OUR turn to propose block #%d!", nextBlockHeight)
+                if err := ce.proposeBlock(nextBlockHeight); err != nil {
+                    ce.logger.Printf("Failed to propose block #%d: %v", nextBlockHeight, err)
+                }
+            }
+        }
+    }
 }
 
-// PublicKeyBytesToHexString converts raw public key bytes to a hexadecimal string.
-// Useful for display and canonical JSON representation.
-func PublicKeyBytesToHexString(pubKeyBytes []byte) string {
-	return hex.EncodeToString(pubKeyBytes)
+func (ce *ConsensusEngine) proposeBlock(height int64) error {
+    lastBlock, err := ce.blockchain.GetLastBlock()
+    if err != nil {
+        return fmt.Errorf("%w: %v", ErrFailedToGetLastBlock, err)
+    }
+    proposal, err := ce.proposerService.CreateProposalBlock(height, lastBlock.Hash, lastBlock.Timestamp)
+    if err != nil {
+        return fmt.Errorf("%w: %v", ErrProposeBlockFailed, err)
+    }
+    if err := ce.network.BroadcastBlock(proposal); err != nil {
+        return fmt.Errorf("failed to broadcast proposed block %d: %w", height, err)
+    }
+    ce.logger.Printf("Proposed and broadcasted block #%d (%x).", proposal.Height, proposal.Hash)
+    return nil
 }
 
-// HexStringToPublicKeyBytes converts a hexadecimal string back to raw public key bytes.
-// Useful for deserialization from JSON or configuration.
-func HexStringToPublicKeyBytes(hexString string) ([]byte, error) {
-	data, err := hex.DecodeString(hexString)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode hex string to public key bytes: %w", err)
-	}
-	return data, nil
+func (ce *ConsensusEngine) processIncomingBlocks() {
+    defer ce.wg.Done()
+    ce.logger.Println("Incoming block processor started.")
+
+    for {
+        select {
+        case <-ce.ctx.Done():
+            ce.logger.Println("Incoming block processor received stop signal.")
+            return
+        case incomingBlock := <-ce.network.ReceiveBlocks():
+            ce.logger.Printf("Received block #%d (%x) from network. Proposer: %x",
+                incomingBlock.Height, incomingBlock.Hash, incomingBlock.ProposerAddress)
+            if err := ce.validationService.ValidateBlock(incomingBlock); err != nil {
+                ce.logger.Printf("Incoming block #%d (%x) is INVALID: %v", incomingBlock.Height, incomingBlock.Hash, err)
+                continue
+            }
+            if err := ce.blockchain.AddBlock(incomingBlock); err != nil {
+                ce.logger.Printf("Failed to add validated block #%d (%x) to blockchain: %v", incomingBlock.Height, incomingBlock.Hash, err)
+                continue
+            }
+            if err := ce.consensusState.UpdateHeight(incomingBlock.Height); err != nil {
+                ce.logger.Printf("Failed to update consensus state height after adding block %d: %v", incomingBlock.Height, err)
+            }
+        }
+    }
 }

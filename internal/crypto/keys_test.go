@@ -1,209 +1,187 @@
-package crypto
+package consensus
 
 import (
-	"bytes"
-	"os"
-	"testing"
+    "bytes"
+    "context"
+    "empower1.com/core/core"
+    "errors"
+    "fmt"
+    "log"
+    "os"
+    "sync"
+    "sync/atomic"
+    "time"
 )
 
-func TestGenerateECDSAKeyPair(t *testing.T) {
-	privKey, err := GenerateECDSAKeyPair()
-	if err != nil {
-		t.Fatalf("GenerateECDSAKeyPair() error = %v", err)
-	}
-	if privKey == nil {
-		t.Fatalf("GenerateECDSAKeyPair() private key is nil")
-	}
-	if privKey.PublicKey.X == nil || privKey.PublicKey.Y == nil {
-		t.Fatalf("GenerateECDSAKeyPair() public key coordinates are nil")
-	}
-	// Check curve is P256
-	if privKey.PublicKey.Curve.Params().Name != "P-256" {
-		t.Errorf("Expected P256 curve, got %s", privKey.PublicKey.Curve.Params().Name)
-	}
+var (
+    ErrEngineAlreadyRunning  = errors.New("consensus engine is already running")
+    ErrEngineNotRunning      = errors.New("consensus engine is not running")
+    ErrInvalidEngineConfig   = errors.New("invalid consensus engine configuration")
+    ErrFailedToGetLastBlock  = errors.New("failed to get last block from blockchain")
+    ErrFailedToGetProposer   = errors.New("failed to get proposer for height")
+    ErrProposeBlockFailed    = errors.New("failed to propose block")
+    ErrIncomingBlockInvalid  = errors.New("incoming block is invalid")
+    ErrFailedToAddBlock      = errors.New("failed to add block to blockchain")
+)
+
+type SimulatedNetwork interface {
+    BroadcastBlock(block *core.Block) error
+    ReceiveBlocks() <-chan *core.Block
 }
 
-func TestPublicKeySerializationDeserialization(t *testing.T) {
-	privKey, _ := GenerateECDSAKeyPair()
-	pubKey := &privKey.PublicKey
+type ConsensusEngine struct {
+    validatorAddress  string
+    isValidator       bool
+    proposerService   *ProposerService
+    validationService *ValidationService
+    consensusState    *ConsensusState
+    blockchain        *core.Blockchain
+    network           SimulatedNetwork
 
-	serialized := SerializePublicKeyToBytes(pubKey)
-	if serialized == nil {
-		t.Fatalf("SerializePublicKeyToBytes() returned nil")
-	}
-
-	deserializedPubKey, err := DeserializePublicKeyFromBytes(serialized)
-	if err != nil {
-		t.Fatalf("DeserializePublicKeyFromBytes() error = %v", err)
-	}
-
-	if !bytes.Equal(SerializePublicKeyToBytes(pubKey), SerializePublicKeyToBytes(deserializedPubKey)) {
-		t.Errorf("Original and deserialized public keys do not match")
-	}
-	if pubKey.X.Cmp(deserializedPubKey.X) != 0 || pubKey.Y.Cmp(deserializedPubKey.Y) != 0 {
-		t.Errorf("Original and deserialized public key coordinates do not match")
-	}
+    ctx       context.Context
+    cancel    context.CancelFunc
+    wg        sync.WaitGroup
+    logger    *log.Logger
+    isRunning atomic.Bool
+    startOnce sync.Once
+    stopOnce  sync.Once
 }
 
-func TestAddressConversion(t *testing.T) {
-	privKey, _ := GenerateECDSAKeyPair()
-	pubKeyBytes := SerializePublicKeyToBytes(&privKey.PublicKey)
+func NewConsensusEngine(
+    validatorAddress string,
+    proposerService *ProposerService,
+    validationService *ValidationService,
+    consensusState *ConsensusState,
+    blockchain *core.Blockchain,
+    network SimulatedNetwork,
+) (*ConsensusEngine, error) {
+    if proposerService == nil || validationService == nil || consensusState == nil || blockchain == nil || network == nil {
+        return nil, fmt.Errorf("%w: all core services must be provided", ErrInvalidEngineConfig)
+    }
+    isValidator := (proposerService != nil && proposerService.validatorAddress == validatorAddress)
+    logger := log.New(os.Stdout, "CONSENSUS_ENGINE: ", log.Ldate|log.Ltime|log.Lshortfile)
+    ctx, cancel := context.WithCancel(context.Background())
 
-	address := PublicKeyBytesToAddress(pubKeyBytes)
-	if address == "" {
-		t.Fatalf("PublicKeyBytesToAddress() returned empty string")
-	}
-	if len(address) != 130 { // 04 + 32 bytes for X + 32 bytes for Y, hex encoded = 2 + 64 + 64
-		t.Errorf("Expected address length 130, got %d", len(address))
-	}
-
-
-	retrievedPubKeyBytes, err := AddressToPublicKeyBytes(address)
-	if err != nil {
-		t.Fatalf("AddressToPublicKeyBytes() error = %v", err)
-	}
-	if !bytes.Equal(pubKeyBytes, retrievedPubKeyBytes) {
-		t.Errorf("Original public key bytes and bytes from address do not match")
-	}
+    engine := &ConsensusEngine{
+        validatorAddress:  validatorAddress,
+        isValidator:       isValidator,
+        proposerService:   proposerService,
+        validationService: validationService,
+        consensusState:    consensusState,
+        blockchain:        blockchain,
+        network:           network,
+        logger:            logger,
+        ctx:               ctx,
+        cancel:            cancel,
+    }
+    engine.logger.Println("ConsensusEngine initialized.")
+    return engine, nil
 }
 
-func TestPrivateKeyPEMSerialization(t *testing.T) {
-	privKey, _ := GenerateECDSAKeyPair()
-
-	// Test without password
-	pemBytes, err := SerializePrivateKeyToPEM(privKey, nil) // Pass nil for no password
-	if err != nil {
-		t.Fatalf("SerializePrivateKeyToPEM() without password error = %v", err)
-	}
-	deserializedPrivKey, err := DeserializePrivateKeyFromPEM(pemBytes, nil) // Pass nil for no password
-	if err != nil {
-		t.Fatalf("DeserializePrivateKeyFromPEM() without password error = %v", err)
-	}
-	if privKey.D.Cmp(deserializedPrivKey.D) != 0 ||
-		privKey.PublicKey.X.Cmp(deserializedPrivKey.PublicKey.X) != 0 ||
-		privKey.PublicKey.Y.Cmp(deserializedPrivKey.PublicKey.Y) != 0 {
-		t.Errorf("Original and deserialized private keys (no password) do not match")
-	}
-
-	// Test with password: Current Go SerializePrivateKeyToPEM ignores the password and saves unencrypted.
-	// So, deserializing with or without the password (or a wrong password) should still succeed
-	// because the key is not actually encrypted in the PEM data from Go's serialization.
-	password := "testpassword"
-	pemBytesWithPwdIgnored, err := SerializePrivateKeyToPEM(privKey, []byte(password))
-	if err != nil {
-		t.Fatalf("SerializePrivateKeyToPEM() with password (but ignored) error = %v", err)
-	}
-
-	// Attempt to deserialize with correct password (should work, as it's unencrypted)
-	deserializedPrivKeyPwd, err := DeserializePrivateKeyFromPEM(pemBytesWithPwdIgnored, []byte(password))
-	if err != nil {
-		t.Fatalf("DeserializePrivateKeyFromPEM() with password (for unencrypted key) error = %v", err)
-	}
-	if privKey.D.Cmp(deserializedPrivKeyPwd.D) != 0 {
-		t.Errorf("Deserialized key (with password, from unencrypted PEM) does not match original")
-	}
-
-	// Attempt to deserialize with wrong password (should still work, as it's unencrypted)
-	deserializedPrivKeyWrongPwd, err := DeserializePrivateKeyFromPEM(pemBytesWithPwdIgnored, []byte("wrongpassword"))
-	if err != nil {
-		t.Fatalf("DeserializePrivateKeyFromPEM() with wrong password (for unencrypted key) error = %v", err)
-	}
-	if privKey.D.Cmp(deserializedPrivKeyWrongPwd.D) != 0 {
-		t.Errorf("Deserialized key (with wrong password, from unencrypted PEM) does not match original")
-	}
-
-	// Attempt to deserialize with nil password (should still work)
-	deserializedPrivKeyNilPwd, err := DeserializePrivateKeyFromPEM(pemBytesWithPwdIgnored, nil)
-	if err != nil {
-		t.Fatalf("DeserializePrivateKeyFromPEM() with nil password (for unencrypted key) error = %v", err)
-	}
-	if privKey.D.Cmp(deserializedPrivKeyNilPwd.D) != 0 {
-		t.Errorf("Deserialized key (with nil password, from unencrypted PEM) does not match original")
-	}
+func (ce *ConsensusEngine) Start() error {
+    var err error
+    ce.startOnce.Do(func() {
+        if ce.isRunning.Load() {
+            err = ErrEngineAlreadyRunning
+            return
+        }
+        ce.isRunning.Store(true)
+        ce.wg.Add(2)
+        go ce.startEngineLoop()
+        go ce.processIncomingBlocks()
+        ce.logger.Println("ConsensusEngine started.")
+    })
+    return err
 }
 
-func TestPublicKeyPEMSerialization(t *testing.T) {
-	privKey, _ := GenerateECDSAKeyPair()
-	pubKey := &privKey.PublicKey
-
-	pemBytes, err := SerializePublicKeyToPEM(pubKey)
-	if err != nil {
-		t.Fatalf("SerializePublicKeyToPEM() error = %v", err)
-	}
-	deserializedPubKey, err := DeserializePublicKeyFromPEM(pemBytes)
-	if err != nil {
-		t.Fatalf("DeserializePublicKeyFromPEM() error = %v", err)
-	}
-	if pubKey.X.Cmp(deserializedPubKey.X) != 0 || pubKey.Y.Cmp(deserializedPubKey.Y) != 0 {
-		t.Errorf("Original and deserialized public keys (PEM) do not match")
-	}
+func (ce *ConsensusEngine) Stop() error {
+    var err error
+    ce.stopOnce.Do(func() {
+        if !ce.isRunning.Load() {
+            err = ErrEngineNotRunning
+            return
+        }
+        ce.cancel()
+        ce.wg.Wait()
+        ce.isRunning.Store(false)
+        ce.logger.Println("ConsensusEngine stopped.")
+    })
+    return err
 }
 
-func TestFileOperations(t *testing.T) {
-	privKey, _ := GenerateECDSAKeyPair()
-	pubKey := &privKey.PublicKey
-	password := "fileopstest"
-	privKeyFile := "test_priv.pem"
-	pubKeyFile := "test_pub.pem"
+func (ce *ConsensusEngine) startEngineLoop() {
+    defer ce.wg.Done()
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
 
-	defer os.Remove(privKeyFile)
-	defer os.Remove(pubKeyFile)
+    ce.logger.Println("Engine loop started.")
 
-	// Test Save/Load Private Key (unencrypted, password nil for save)
-	err := SavePrivateKeyPEM(privKey, privKeyFile, nil)
-	if err != nil {
-		t.Fatalf("SavePrivateKeyPEM() without password error = %v", err)
-	}
-	loadedPrivKey, err := LoadPrivateKeyPEM(privKeyFile, nil)
-	if err != nil {
-		t.Fatalf("LoadPrivateKeyPEM() without password error = %v", err)
-	}
-	if privKey.D.Cmp(loadedPrivKey.D) != 0 {
-		t.Errorf("Saved and loaded unencrypted private keys (nil password) do not match")
-	}
-	os.Remove(privKeyFile)
+    for {
+        select {
+        case <-ce.ctx.Done():
+            ce.logger.Println("Engine loop received stop signal.")
+            return
+        case <-ticker.C:
+            currentChainHeight := ce.blockchain.ChainHeight()
+            if currentChainHeight == -1 {
+                ce.logger.Println("Blockchain is empty, waiting for genesis block to sync or be created.")
+                continue
+            }
+            nextBlockHeight := currentChainHeight + 1
+            expectedProposer, err := ce.consensusState.GetProposerForHeight(nextBlockHeight)
+            if err != nil {
+                ce.logger.Printf("Failed to get proposer for height %d: %v", nextBlockHeight, err)
+                continue
+            }
+            if ce.isValidator && bytes.Equal([]byte(ce.validatorAddress), expectedProposer.Address) {
+                ce.logger.Printf("It's OUR turn to propose block #%d!", nextBlockHeight)
+                if err := ce.proposeBlock(nextBlockHeight); err != nil {
+                    ce.logger.Printf("Failed to propose block #%d: %v", nextBlockHeight, err)
+                }
+            }
+        }
+    }
+}
 
-	// Test Save/Load Private Key (unencrypted, password provided to save but ignored by Go's save)
-	err = SavePrivateKeyPEM(privKey, privKeyFile, []byte(password))
-	if err != nil {
-		t.Fatalf("SavePrivateKeyPEM() with password (but ignored) error = %v", err)
-	}
-	// Load with correct, wrong, and nil password - all should work as it's saved unencrypted
-	loadedPrivKeyCorrectPwd, err := LoadPrivateKeyPEM(privKeyFile, []byte(password))
-	if err != nil {
-		t.Fatalf("LoadPrivateKeyPEM() with correct password (for unencrypted file) error = %v", err)
-	}
-	if privKey.D.Cmp(loadedPrivKeyCorrectPwd.D) != 0 {
-		t.Errorf("Saved (pwd ignored) and loaded (correct pwd) private keys do not match")
-	}
+func (ce *ConsensusEngine) proposeBlock(height int64) error {
+    lastBlock, err := ce.blockchain.GetLastBlock()
+    if err != nil {
+        return fmt.Errorf("%w: %v", ErrFailedToGetLastBlock, err)
+    }
+    proposal, err := ce.proposerService.CreateProposalBlock(height, lastBlock.Hash, lastBlock.Timestamp)
+    if err != nil {
+        return fmt.Errorf("%w: %v", ErrProposeBlockFailed, err)
+    }
+    if err := ce.network.BroadcastBlock(proposal); err != nil {
+        return fmt.Errorf("failed to broadcast proposed block %d: %w", height, err)
+    }
+    ce.logger.Printf("Proposed and broadcasted block #%d (%x).", proposal.Height, proposal.Hash)
+    return nil
+}
 
-	loadedPrivKeyWrongPwd, err := LoadPrivateKeyPEM(privKeyFile, []byte("stillwrong"))
-	if err != nil {
-		t.Fatalf("LoadPrivateKeyPEM() with wrong password (for unencrypted file) error = %v", err)
-	}
-	if privKey.D.Cmp(loadedPrivKeyWrongPwd.D) != 0 {
-		t.Errorf("Saved (pwd ignored) and loaded (wrong pwd) private keys do not match")
-	}
+func (ce *ConsensusEngine) processIncomingBlocks() {
+    defer ce.wg.Done()
+    ce.logger.Println("Incoming block processor started.")
 
-	loadedPrivKeyNilPwd, err := LoadPrivateKeyPEM(privKeyFile, nil)
-	if err != nil {
-		t.Fatalf("LoadPrivateKeyPEM() with nil password (for unencrypted file) error = %v", err)
-	}
-	if privKey.D.Cmp(loadedPrivKeyNilPwd.D) != 0 {
-		t.Errorf("Saved (pwd ignored) and loaded (nil pwd) private keys do not match")
-	}
-
-
-	// Test Save/Load Public Key
-	err = SavePublicKeyPEM(pubKey, pubKeyFile)
-	if err != nil {
-		t.Fatalf("SavePublicKeyPEM() error = %v", err)
-	}
-	loadedPubKey, err := LoadPublicKeyPEM(pubKeyFile)
-	if err != nil {
-		t.Fatalf("LoadPublicKeyPEM() error = %v", err)
-	}
-	if pubKey.X.Cmp(loadedPubKey.X) != 0 || pubKey.Y.Cmp(loadedPubKey.Y) != 0 {
-		t.Errorf("Saved and loaded public keys do not match")
-	}
+    for {
+        select {
+        case <-ce.ctx.Done():
+            ce.logger.Println("Incoming block processor received stop signal.")
+            return
+        case incomingBlock := <-ce.network.ReceiveBlocks():
+            ce.logger.Printf("Received block #%d (%x) from network. Proposer: %x",
+                incomingBlock.Height, incomingBlock.Hash, incomingBlock.ProposerAddress)
+            if err := ce.validationService.ValidateBlock(incomingBlock); err != nil {
+                ce.logger.Printf("Incoming block #%d (%x) is INVALID: %v", incomingBlock.Height, incomingBlock.Hash, err)
+                continue
+            }
+            if err := ce.blockchain.AddBlock(incomingBlock); err != nil {
+                ce.logger.Printf("Failed to add validated block #%d (%x) to blockchain: %v", incomingBlock.Height, incomingBlock.Hash, err)
+                continue
+            }
+            if err := ce.consensusState.UpdateHeight(incomingBlock.Height); err != nil {
+                ce.logger.Printf("Failed to update consensus state height after adding block %d: %v", incomingBlock.Height, err)
+            }
+        }
+    }
 }

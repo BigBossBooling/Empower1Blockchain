@@ -1,31 +1,30 @@
 package vm
 
 import (
-	"bytes"
 	"errors" // Explicitly import errors
 	"fmt"
-	"log"    // For structured logging
-	"os"     // For log output
-	"time"   // For potential future timeouts or execution tracking
+	"log"  // For structured logging
+	"os"   // For log output
+	"time" // For potential future timeouts or execution tracking
 
 	"github.com/wasmerio/wasmer-go/wasmer"
 
-	"empower1.com/core/core"  // Assuming this path to core package for Block, Transaction types etc.
+	// Assuming this path to core package for Block, Transaction types etc.
 	"empower1.com/core/state" // Assuming this path to state package for state.State interaction
-	"empower1.com/core/crypto" // Assuming this path for crypto functions like DID generation
+	// Assuming this path for crypto functions like DID generation
 )
 
 // --- Custom Errors for VM Service ---
 var (
-	ErrVMInit                  = errors.New("vm service initialization error")
-	ErrWASMCompile             = errors.New("failed to compile WASM module")
-	ErrWASMInstantiate         = errors.New("failed to instantiate WASM module")
-	ErrWASMExportMissing       = errors.New("missing WASM export (function or memory)")
-	ErrWASMExecution           = errors.New("wasm function execution failed")
-	ErrOutOfGas                = errors.New("out of gas during WASM execution") // Defined in gas.go
-	ErrHostFunctionExecution   = errors.New("host function execution failed")
-	ErrInvalidHostEnv          = errors.New("invalid host environment for WASM call")
-	ErrInvalidCallerKey        = errors.New("invalid caller public key provided")
+	ErrVMInit                = errors.New("vm service initialization error")
+	ErrWASMCompile           = errors.New("failed to compile WASM module")
+	ErrWASMInstantiate       = errors.New("failed to instantiate WASM module")
+	ErrWASMExportMissing     = errors.New("missing WASM export (function or memory)")
+	ErrWASMExecution         = errors.New("wasm function execution failed")
+	ErrOutOfGas              = errors.New("out of gas during WASM execution") // Defined in gas.go
+	ErrHostFunctionExecution = errors.New("host function execution failed")
+	ErrInvalidHostEnv        = errors.New("invalid host environment for WASM call")
+	ErrInvalidCallerKey      = errors.New("invalid caller public key provided")
 )
 
 // VMService is responsible for executing WASM smart contracts.
@@ -34,7 +33,7 @@ type VMService struct {
 	// For reusability, a Wasmer engine and store *could* be stored here,
 	// but often, they are created per execution context for isolation.
 	// For V1, creating a new engine/store per execution is simpler and safer.
-	logger *log.Logger // Dedicated logger for the VMService
+	logger *log.Logger  // Dedicated logger for the VMService
 	state  *state.State // Reference to the global blockchain state for host functions
 }
 
@@ -56,13 +55,13 @@ func NewVMService(state *state.State) (*VMService, error) {
 // --- Host Function Environment (Passed to WASM modules) ---
 // This struct makes blockchain state and context available to WASM smart contracts.
 type HostFunctionEnvironment struct {
-	ContractAddress []byte          // Address of the contract currently being executed
-	CallerPublicKey []byte          // Public key bytes of the caller/signer of the transaction
-	GasTank         *GasTank        // Reference to the gas metering mechanism
-	Memory          *wasmer.Memory  // WASM instance memory (set after instance creation)
+	ContractAddress []byte           // Address of the contract currently being executed
+	CallerPublicKey []byte           // Public key bytes of the caller/signer of the transaction
+	GasTank         *GasTank         // Reference to the gas metering mechanism
+	Memory          *wasmer.Memory   // WASM instance memory (set after instance creation)
 	Instance        *wasmer.Instance // Reference to the WASM instance itself (for internal calls, V2+)
-	Logger          *log.Logger     // Logger for host functions
-	State           *state.State    // Reference to the global blockchain state
+	Logger          *log.Logger      // Logger for host functions
+	State           *state.State     // Reference to the global blockchain state
 }
 
 // Ensure interface compliance for Wasmer environment
@@ -104,55 +103,63 @@ func (env *HostFunctionEnvironment) OnInstantiated(instance *wasmer.Instance) er
 
 // BlockchainSetStorage (keyPtr, keyLen, valPtr, valLen) -> (errCode)
 func BlockchainSetStorage(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil // Dummy success
-}
-// BlockchainGetStorage (keyPtr, keyLen, retBufPtr, retBufLen) -> (actualValLen)
-func BlockchainGetStorage(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil // Dummy length
-}
-// BlockchainLogMessage (msgPtr, msgLen) -> ()
-func BlockchainLogMessage(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{}, nil
-}
-// BlockchainEmitEvent (topicPtr, topicLen, dataPtr, dataLen) -> ()
-func BlockchainEmitEvent(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{}, nil
-}
-// BlockchainGetCallerPublicKey (retBufPtr, retBufLen) -> (actualKeyLen)
-func BlockchainGetCallerPublicKey(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil // Dummy length
-}
-// BlockchainGenerateDidKey (pubKeyPtr, pubKeyLen, retBufPtr, retBufLen) -> (actualDIDLen)
-func BlockchainGenerateDidKey(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil // Dummy length
-}
-// BlockchainGetCallerAddress (retBufPtr, retBufLen) -> (actualLen)
-func BlockchainGetCallerAddress(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil
-}
-// BlockchainGetBalance (addressPtr, addressLen) -> (balance)
-func BlockchainGetBalance(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{wasmer.NewI64(0)}, nil
-}
-// BlockchainSendFunds (toAddrPtr, toAddrLen, amount) -> (errCode)
-func BlockchainSendFunds(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil
-}
-// BlockchainGetBlockTimestamp () -> (timestamp)
-func BlockchainGetBlockTimestamp(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
-    // ... actual implementation from host_functions.go ...
-    return []wasmer.IntoWasmValue{wasmer.NewI64(time.Now().UnixNano())}, nil
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil // Dummy success
 }
 
+// BlockchainGetStorage (keyPtr, keyLen, retBufPtr, retBufLen) -> (actualValLen)
+func BlockchainGetStorage(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil // Dummy length
+}
+
+// BlockchainLogMessage (msgPtr, msgLen) -> ()
+func BlockchainLogMessage(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{}, nil
+}
+
+// BlockchainEmitEvent (topicPtr, topicLen, dataPtr, dataLen) -> ()
+func BlockchainEmitEvent(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{}, nil
+}
+
+// BlockchainGetCallerPublicKey (retBufPtr, retBufLen) -> (actualKeyLen)
+func BlockchainGetCallerPublicKey(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil // Dummy length
+}
+
+// BlockchainGenerateDidKey (pubKeyPtr, pubKeyLen, retBufPtr, retBufLen) -> (actualDIDLen)
+func BlockchainGenerateDidKey(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil // Dummy length
+}
+
+// BlockchainGetCallerAddress (retBufPtr, retBufLen) -> (actualLen)
+func BlockchainGetCallerAddress(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil
+}
+
+// BlockchainGetBalance (addressPtr, addressLen) -> (balance)
+func BlockchainGetBalance(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{wasmer.NewI64(0)}, nil
+}
+
+// BlockchainSendFunds (toAddrPtr, toAddrLen, amount) -> (errCode)
+func BlockchainSendFunds(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{wasmer.NewI32(0)}, nil
+}
+
+// BlockchainGetBlockTimestamp () -> (timestamp)
+func BlockchainGetBlockTimestamp(envPtr wasmer.IntoWasmValue, args []wasmer.IntoWasmValue) ([]wasmer.IntoWasmValue, error) {
+	// ... actual implementation from host_functions.go ...
+	return []wasmer.IntoWasmValue{wasmer.NewI64(time.Now().UnixNano())}, nil
+}
 
 // ExecuteContract loads and runs a WASM contract.
 // It manages the Wasmer lifecycle (engine, store, module, instance) per execution for isolation.
@@ -160,15 +167,18 @@ func BlockchainGetBlockTimestamp(envPtr wasmer.IntoWasmValue, args []wasmer.Into
 func (vms *VMService) ExecuteContract(
 	contractAddress []byte, // Address of the contract being executed
 	callerPublicKey []byte, // Raw public key of the transaction signer/caller
-	wasmCode []byte,        // WASM bytecode of the contract
-	functionName string,    // Name of the exported WASM function to call
-	gasLimit uint64,        // Maximum gas allowed for this execution
+	wasmCode []byte, // WASM bytecode of the contract
+	functionName string, // Name of the exported WASM function to call
+	gasLimit uint64, // Maximum gas allowed for this execution
 	args ...wasmer.IntoWasmValue, // Arguments to pass to the WASM function
 ) (result interface{}, gasConsumed uint64, err error) {
 
 	// Initialize GasTank for this execution, adhering to "Know Your Core, Keep it Clear" for resource management.
-	gasTank := NewGasTank(gasLimit)
-	
+	gasTank, err := NewGasTank(params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize GasTank: %w", err)
+	}
+
 	// Create new Wasmer engine and store for each execution for isolation and security.
 	// This ensures clean state for each contract call, crucial for integrity.
 	engine := wasmer.NewEngine()
@@ -192,16 +202,16 @@ func (vms *VMService) ExecuteContract(
 	// Register host functions (imports) for the WASM module.
 	importObject := wasmer.NewImportObject()
 	envImports := map[string]wasmer.IntoExtern{
-		"blockchain_set_storage":         wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainSetStorage),
-		"blockchain_get_storage":         wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainGetStorage),
-		"host_log_message":               wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32), wasmer.NewValueTypes()), hostEnv, BlockchainLogMessage),
-		"blockchain_emit_event":          wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I32, wasmer.I32), wasmer.NewValueTypes()), hostEnv, BlockchainEmitEvent),
+		"blockchain_set_storage":           wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainSetStorage),
+		"blockchain_get_storage":           wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainGetStorage),
+		"host_log_message":                 wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32), wasmer.NewValueTypes()), hostEnv, BlockchainLogMessage),
+		"blockchain_emit_event":            wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I32, wasmer.I32), wasmer.NewValueTypes()), hostEnv, BlockchainEmitEvent),
 		"blockchain_get_caller_public_key": wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainGetCallerPublicKey),
-		"blockchain_generate_did_key":    wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainGenerateDidKey),
-		"blockchain_get_caller_address":  wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainGetCallerAddress),
-		"blockchain_get_balance":         wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I64)), hostEnv, BlockchainGetBalance),
-		"blockchain_send_funds":          wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I64), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainSendFunds),
-		"blockchain_get_block_timestamp": wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(), wasmer.NewValueTypes(wasmer.I64)), hostEnv, BlockchainGetBlockTimestamp),
+		"blockchain_generate_did_key":      wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainGenerateDidKey),
+		"blockchain_get_caller_address":    wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainGetCallerAddress),
+		"blockchain_get_balance":           wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32), wasmer.NewValueTypes(wasmer.I64)), hostEnv, BlockchainGetBalance),
+		"blockchain_send_funds":            wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(wasmer.I32, wasmer.I32, wasmer.I64), wasmer.NewValueTypes(wasmer.I32)), hostEnv, BlockchainSendFunds),
+		"blockchain_get_block_timestamp":   wasmer.NewFunctionWithEnvironment(store, wasmer.NewFunctionType(wasmer.NewValueTypes(), wasmer.NewValueTypes(wasmer.I64)), hostEnv, BlockchainGetBlockTimestamp),
 	}
 	importObject.Register("env", envImports)
 
@@ -234,10 +244,10 @@ func (vms *VMService) ExecuteContract(
 	if errExec != nil {
 		// Log detailed error from WASM execution.
 		vms.logger.Errorf("VM: Error calling WASM function '%s' for contract %x: %v", functionName, contractAddress, errExec)
-		
+
 		// Differentiate OutOfGas from other WASM traps/runtime errors.
 		// If our GasTank is empty, it's an OutOfGas. Wasmer TrapError could also be OOG if metering within Wasmer.
-		if gasTank.GasRemaining() == 0 { 
+		if gasTank.GasRemaining() == 0 {
 			return nil, gasTank.GasConsumed(), ErrOutOfGas
 		}
 		if _, ok := errExec.(*wasmer.TrapError); ok {
@@ -255,7 +265,7 @@ func (vms *VMService) ExecuteContract(
 	} else {
 		finalResult = nil // No return value
 	}
-	
+
 	vms.logger.Printf("VM: Executed contract %x, function '%s'. Gas Used: %d", contractAddress, functionName, gasTank.GasConsumed())
 	return finalResult, gasTank.GasConsumed(), nil
 }

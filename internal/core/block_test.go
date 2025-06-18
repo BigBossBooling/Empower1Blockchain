@@ -1,289 +1,539 @@
-package core
+package consensus
 
 import (
 	"bytes"
-	"encoding/hex" // For logging/displaying hashes
+	"context" // For context.WithCancel, context.Background
+	"crypto/sha256"
+	"errors"
+	"log"    // For structured logging in tests
+	"os"     // For log.New output
+	"sync"   // For sync.WaitGroup, sync.Mutex for mocks
+	"sync/atomic" // For atomic.Bool
 	"testing"
-	"time" // Re-added for timestamp checks, if needed
-	// Assuming 'internal/crypto' contains actual key generation for testing real crypto later
-	// "empower1.com/core/internal/crypto"
+	"time"
+
+	"empower1.com/core/core" // Core blockchain entities (Block, Transaction, Validator)
 )
 
-// --- Helper functions for creating dummy transactions for tests ---
-// (Adhering to "Know Your Core, Keep it Clear" for test data setup)
-func newDummyTx(txType TxType, data string, inputs, outputs int) Transaction {
-	tx := Transaction{
-		ID:        sha256.Sum256([]byte(data + time.Now().String())), // Unique ID
-		Timestamp: time.Now().UnixNano(),
-		TxType:    txType,
-		Metadata:  map[string]string{"test_data": data},
-	}
-	// Simulate inputs/outputs - actual structs not needed for basic block test
-	for i := 0; i < inputs; i++ {
-		tx.Inputs = append(tx.Inputs, TxInput{TxID: []byte(fmt.Sprintf("prev_tx_%d", i)), Vout: i, PubKey: []byte("sender_pubkey")})
-	}
-	for i := 0; i < outputs; i++ {
-		tx.Outputs = append(tx.Outputs, TxOutput{Value: int64(100 + i), PubKeyHash: []byte(fmt.Sprintf("receiver_pubkey_hash_%d", i))})
-	}
-	return tx
+// --- Mock Implementations (Enhanced for Realism and Test Coverage) ---
+// These mocks meticulously simulate external dependencies, allowing isolated and precise testing of ConsensusEngine.
+
+// mockNetwork simulates the P2P network layer for testing.
+// It allows control over blocks/transactions sent and received, and tracks broadcasts.
+type mockNetwork struct {
+	broadcastedBlocks []*core.Block
+	broadcastedTxs    []*core.Transaction
+	recvChan          chan *core.Block // Channel for blocks incoming to engine
+	txRecvChan        chan *core.Transaction // Channel for transactions incoming to mempool
+	mu                sync.Mutex             // Protects broadcasted lists
 }
 
-// --- Test Cases ---
-
-func TestNewBlock(t *testing.T) {
-	// Creating dummy previous block data for comprehensive test, as PrevBlockHash is now []byte
-	prevBlock := NewBlock(0, []byte("genesis_prev_hash"), []byte{newDummyTx(StandardTx, "genesis_tx", 1, 1)}) // Use an actual slice of Transaction
-
-	height := int64(1)
-	transactions := []Transaction{
-		newDummyTx(StandardTx, "tx1_data", 1, 2),
-		newDummyTx(StimulusTx, "stimulus_tx_data", 0, 1), // EmPower1 specific TxType
-	}
-
-	block := NewBlock(height, prevBlock.Hash, transactions)
-
-	if block.Height != height {
-		t.Errorf("block.Height = %d; want %d", block.Height, height)
-	}
-	if !bytes.Equal(block.PrevBlockHash, prevBlock.Hash) {
-		t.Errorf("block.PrevBlockHash is incorrect: got %x, want %x", block.PrevBlockHash, prevBlock.Hash)
-	}
-	if len(block.Transactions) != len(transactions) {
-		t.Errorf("block.Transactions length = %d; want %d", len(block.Transactions), len(transactions))
-	}
-	// Verify that transactions are correctly copied/assigned (deep equality might be needed for complex structs)
-	if !bytes.Equal(block.Transactions[0].ID, transactions[0].ID) {
-		t.Errorf("block.Transactions[0] ID is incorrect")
-	}
-	if block.Timestamp == 0 {
-		t.Errorf("block.Timestamp not set")
-	}
-	if block.ProposerAddress != nil { // Should be nil initially
-		t.Errorf("block.ProposerAddress should be nil initially, got %x", block.ProposerAddress)
-	}
-	if block.Signature != nil { // Should be nil initially
-		t.Errorf("block.Signature should be nil initially")
-	}
-	if block.Hash != nil { // Should be nil until SetHash is called
-		t.Errorf("block.Hash should be nil initially")
-	}
-	if block.AIAuditLog != nil { // Should be nil until AI data is processed/added
-		t.Errorf("block.AIAuditLog should be nil initially")
+func newMockNetwork() *mockNetwork {
+	return &mockNetwork{
+		broadcastedBlocks: make([]*core.Block, 0),
+		broadcastedTxs:    make([]*core.Transaction, 0),
+		recvChan:          make(chan *core.Block, 10), // Buffered for multiple sends/receives
+		txRecvChan:        make(chan *core.Transaction, 10),
 	}
 }
 
-func TestBlockSignAndVerifySignature(t *testing.T) {
-	transactions := []Transaction{newDummyTx(StandardTx, "sign_test_tx", 1, 1)}
-	block := NewBlock(1, []byte("prev_hash_sign"), transactions)
+func (m *mockNetwork) BroadcastBlock(block *core.Block) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.broadcastedBlocks = append(m.broadcastedBlocks, block)
+	return nil
+}
 
-	// In a real scenario, this would use actual validator keys
-	// Dummy proposer address (e.g., a hashed public key)
-	proposerAddressBytes := []byte("em_validator_alpha") 
-	privateKeyBytes := []byte("dummy_private_key_for_test") // Not used by current placeholder
+func (m *mockNetwork) BroadcastTransaction(tx *core.Transaction) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.broadcastedTxs = append(m.broadcastedTxs, tx)
+	return nil
+}
 
-	// Test placeholder Sign method
-	err := block.Sign(proposerAddressBytes, privateKeyBytes) 
+func (m *mockNetwork) ReceiveBlocks() <-chan *core.Block {
+	return m.recvChan
+}
+
+func (m *mockNetwork) ReceiveTransactions() <-chan *core.Transaction {
+	return m.txRecvChan
+}
+
+func (m *mockNetwork) GetBroadcastedBlocks() []*core.Block {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	blocksCopy := make([]*core.Block, len(m.broadcastedBlocks))
+	copy(blocksCopy, m.broadcastedBlocks)
+	return blocksCopy
+}
+
+// mockProposerService simulates the ProposerService for testing block creation.
+type mockProposerService struct {
+	validatorAddress []byte
+	proposalErr      error // Error to return on CreateProposalBlock
+	nextProposal     *core.Block // Specific block to return next, if set
+	proposalCounter  int         // To track how many times CreateProposalBlock is called
+}
+
+func newMockProposerService(validatorAddr []byte) *mockProposerService {
+	return &mockProposerService{
+		validatorAddress: validatorAddr,
+	}
+}
+
+func (m *mockProposerService) CreateProposalBlock(height int64, prevHash []byte, prevTime int64) (*core.Block, error) {
+	m.proposalCounter++
+	if m.proposalErr != nil {
+		return nil, m.proposalErr
+	}
+	if m.nextProposal != nil {
+		// Return a deep copy to prevent external modification affecting subsequent calls
+		p := *m.nextProposal
+		return &p, nil
+	}
+	// Default mock block for success cases, ensuring it's a valid core.Block
+	txs := []core.Transaction{} // Can be empty for simplicity in mock
+	block := core.NewBlock(height, prevHash, txs)
+	block.Timestamp = time.Now().UnixNano() // Use real timestamp for uniqueness
+	block.ProposerAddress = m.validatorAddress
+	block.Sign(m.validatorAddress, []byte("dummy_privkey")) // Use the actual Sign method
+	block.SetHash() // Calculate hash
+	return block, nil
+}
+
+// mockValidationService simulates the ValidationService.
+type mockValidationService struct {
+	validateErr error // Error to return on ValidateBlock
+}
+
+func newMockValidationService() *mockValidationService {
+	return &mockValidationService{}
+}
+func (m *mockValidationService) ValidateBlock(block *core.Block) error {
+	return m.validateErr
+}
+
+// mockConsensusState simulates the ConsensusState.
+type mockConsensusState struct {
+	mu           sync.Mutex // Protects height and nextProposer
+	height       int64
+	nextProposer *core.Validator
+	proposerErr  error // Error to return on GetProposerForHeight
+}
+
+func newMockConsensusState(initialHeight int64, nextProposerAddr []byte) *mockConsensusState {
+	return &mockConsensusState{
+		height:       initialHeight,
+		nextProposer: &core.Validator{Address: nextProposerAddr, Stake: 100}, // Dummy validator
+	}
+}
+
+func (m *mockConsensusState) GetProposerForHeight(height int64) (*core.Validator, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proposerErr != nil {
+		return nil, m.proposerErr
+	}
+	return m.nextProposer, nil
+}
+func (m *mockConsensusState) UpdateHeight(height int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if height <= m.height {
+		return errors.New("height not increasing (simulated error)") // Simulate specific error
+	}
+	m.height = height
+	return nil
+}
+func (m *mockConsensusState) CurrentHeight() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.height
+}
+func (m *mockConsensusState) GetValidatorSet() []*core.Validator {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Return a copy to prevent external modification during tests
+	setCopy := make([]*core.Validator, len(m.validatorSet))
+	copy(setCopy, m.validatorSet)
+	return setCopy
+}
+
+// mockBlockchain simulates the Blockchain.
+type mockBlockchain struct {
+	mu           sync.Mutex // Protects height, blocks, lastBlockHash
+	height       int64
+	blocks       map[string]*core.Block // Store blocks by hash
+	lastBlockHash []byte
+	addBlockErr  error // Error to return on AddBlock
+}
+
+func newMockBlockchain(initialHeight int64) *mockBlockchain {
+	// Create a dummy genesis block consistent with core.NewBlockchain's genesis
+	genesisTxs := []core.Transaction{core.Transaction{ID: []byte("mock_genesis_tx")}}
+	genesis := core.NewBlock(0, bytes.Repeat([]byte{0x00}, sha256.Size), genesisTxs)
+	genesis.ProposerAddress = []byte("genesis_proposer")
+	genesis.Sign([]byte("genesis_proposer"), []byte("genesis_privkey")) // Use actual Sign
+	genesis.SetHash()
+
+	blocksMap := make(map[string]*core.Block)
+	blocksMap[string(genesis.Hash)] = genesis
+
+	return &mockBlockchain{
+		height:        initialHeight,
+		blocks:        blocksMap,
+		lastBlockHash: genesis.Hash,
+	}
+}
+
+func (m *mockBlockchain) AddBlock(block *core.Block) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.addBlockErr != nil {
+		return m.addBlockErr
+	}
+	// Basic validation to simulate chain continuity
+	if block.Height != m.height+1 && !(m.height == -1 && block.Height == 0) { // Allow height 0 if empty
+		return errors.New("mock: invalid block height for add")
+	}
+	if !bytes.Equal(block.PrevBlockHash, m.lastBlockHash) && !(m.height == -1 && block.Height == 0) {
+		return errors.New("mock: invalid prev block hash for add")
+	}
+
+	m.blocks[string(block.Hash)] = block
+	m.height = block.Height
+	m.lastBlockHash = block.Hash
+	log.Printf("MOCK_BLOCKCHAIN: Added block #%d (%x). New height: %d", block.Height, block.Hash, m.height)
+	return nil
+}
+
+func (m *mockBlockchain) GetLastBlock() (*core.Block, error) {
+	m.mu.Lock() // Using Lock for write access to m.height in tests
+	defer m.mu.Unlock()
+	if m.height == -1 {
+		return nil, errors.New("mock: blockchain is empty")
+	}
+	// Return a deep copy to prevent tests from accidentally modifying the mock's state
+	lastBlock := m.blocks[string(m.lastBlockHash)]
+	bCopy := *lastBlock
+	return &bCopy, nil
+}
+func (m *mockBlockchain) ChainHeight() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.height
+}
+func (m *mockBlockchain) GetBlockByHash(hash []byte) (*core.Block, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.blocks[string(hash)]
+	if !ok {
+		return nil, errors.New("mock: block not found by hash")
+	}
+	// Return a deep copy
+	bCopy := *b
+	return &bCopy, nil
+}
+func (m *mockBlockchain) GetBlockByHeight(height int64) (*core.Block, error) { // Add this for completeness of mock
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    for _, block := range m.blocks {
+        if block.Height == height {
+            bCopy := *block
+            return &bCopy, nil
+        }
+    }
+    return nil, errors.New("mock: block not found by height")
+}
+
+
+// --- Test Setup Helper ---
+
+// setupConsensusEngineTest creates a clean set of mock dependencies and a ConsensusEngine.
+// This streamlines test setups and ensures consistency.
+func setupConsensusEngineTest(t *testing.T, validatorAddr []byte, initialChainHeight int64) (*ConsensusEngine, *mockNetwork, *mockProposerService, *mockValidationService, *mockConsensusState, *mockBlockchain) {
+	// Suppress logging during tests to avoid clutter
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(os.Stdout) // Ensure logging is re-enabled after test run
+
+	mockNet := newMockNetwork()
+	mockProposer := newMockProposerService(validatorAddr)
+	mockValidator := newMockValidationService()
+	// Pass the actual validator address for the state mock as well, for consistency
+	mockState := newMockConsensusState(initialChainHeight, validatorAddr) 
+	mockBlockchain := newMockBlockchain(initialChainHeight)
+
+	engine, err := NewConsensusEngine(validatorAddr, mockProposer, mockValidator, mockState, mockBlockchain, mockNet)
 	if err != nil {
-		t.Fatalf("block.Sign() error = %v", err)
+		t.Fatalf("Engine initialization failed: %v", err)
 	}
-	if !bytes.Equal(block.ProposerAddress, proposerAddressBytes) {
-		t.Errorf("block.ProposerAddress = %x; want %x", block.ProposerAddress, proposerAddressBytes)
+	return engine, mockNet, mockProposer, mockValidator, mockState, mockBlockchain
+}
+
+// --- Tests ---
+
+func TestConsensusEngine_ProposeBlock_Success(t *testing.T) {
+	validatorAddr := []byte("validator1_pubkey")
+	engine, mockNet, mockProposer, _, _, _ := setupConsensusEngineTest(t, validatorAddr, 0)
+
+	// Start engine and ensure it can stop
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Engine start failed: %v", err)
 	}
-	if !bytes.HasPrefix(block.Signature, []byte("empower1-signed-by-")) { // Check our specific dummy prefix
-		t.Errorf("block.Signature is incorrect for placeholder signing: got %s", string(block.Signature))
+	defer engine.Stop()
+
+	// Signal expected proposal (polling mockProposer.proposalCounter)
+	proposalCalled := make(chan struct{})
+	go func() {
+		defer close(proposalCalled)
+		for {
+			select {
+			case <-engine.ctx.Done(): return
+			case <-time.After(50 * time.Millisecond):
+				if mockProposer.proposalCounter > 0 {
+					return // ProposeBlock was called
+				}
+			}
+		}
+	}()
+
+	select {
+	case <-proposalCalled: // Wait for the signal that proposeBlock ran
+		log.Println("Test received proposal signal.") // Debug log
+	case <-time.After(2 * time.Second): // Give enough time for ticker to tick and goroutine to run
+		t.Fatal("Timeout waiting for block proposal.")
 	}
 
-	// Test placeholder VerifySignature method (should pass for valid dummy sig)
-	valid, err := block.VerifySignature()
+	// Assertions for successful proposal
+	broadcastedBlocks := mockNet.GetBroadcastedBlocks()
+	if len(broadcastedBlocks) == 0 {
+		t.Error("Expected block to be broadcasted, got none.")
+	}
+	if mockProposer.proposalCounter == 0 {
+		t.Error("Expected proposerService.CreateProposalBlock to be called, was not.")
+	}
+	// Further check: broadcasted block should be height 1
+	if len(broadcastedBlocks) > 0 && broadcastedBlocks[0].Height != 1 {
+		t.Errorf("Broadcasted block height was %d, expected 1", broadcastedBlocks[0].Height)
+	}
+}
+
+func TestConsensusEngine_HandleIncomingBlock_Valid(t *testing.T) {
+	validatorAddr := []byte("validator_node_A")
+	otherValidatorAddr := []byte("validator_node_B") // Proposer of incoming block
+	engine, mockNet, _, _, mockState, mockBlockchain := setupConsensusEngineTest(t, validatorAddr, 0)
+
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Engine start failed: %v", err)
+	}
+	defer engine.Stop()
+
+	// Simulate an incoming valid block from another peer (height 1)
+	txs := []core.Transaction{core.Transaction{ID: []byte("tx_inc_block1")}}
+	incomingValidBlock := core.NewBlock(1, mockBlockchain.lastBlockHash, txs)
+	incomingValidBlock.Timestamp = time.Now().UnixNano() + 10
+	incomingValidBlock.ProposerAddress = otherValidatorAddr
+	incomingValidBlock.Sign(otherValidatorAddr, []byte("dummy_privkey_other"))
+	incomingValidBlock.SetHash()
+
+	// Send the block to the engine's incoming channel
+	mockNet.recvChan <- incomingValidBlock
+
+	// Give time for the goroutine to process the block and update state
+	time.Sleep(200 * time.Millisecond)
+
+	// Assertions
+	if mockBlockchain.ChainHeight() != 1 {
+		t.Errorf("Expected blockchain height to be 1, got %d", mockBlockchain.ChainHeight())
+	}
+	if mockState.CurrentHeight() != 1 {
+		t.Errorf("Expected consensus state height to be 1, got %d", mockState.CurrentHeight())
+	}
+	_, err := mockBlockchain.GetBlockByHash(incomingValidBlock.Hash)
 	if err != nil {
-		t.Fatalf("block.VerifySignature() error = %v", err)
+		t.Errorf("Expected incoming valid block to be added to blockchain, got error: %v", err)
 	}
-	if !valid {
-		t.Errorf("block.VerifySignature() = false; want true for placeholder signature")
-	}
+}
 
-	// --- Test error conditions ---
-	// Test with empty ProposerAddress to Sign
-	block2 := NewBlock(2, []byte("hash2"), transactions)
-	err = block2.Sign(nil, privateKeyBytes)
-	if err == nil || !errors.Is(err, ErrMissingProposer) { // Use errors.Is for custom errors
-		t.Errorf("Expected ErrMissingProposer for Sign with nil ProposerAddress, got %v", err)
+func TestConsensusEngine_HandleIncomingBlock_Invalid(t *testing.T) {
+	validatorAddr := []byte("validator_node_C")
+	invalidProposerAddr := []byte("invalid_proposer_X")
+	engine, mockNet, _, mockValidator, mockState, mockBlockchain := setupConsensusEngineTest(t, validatorAddr, 0)
+	mockValidator.validateErr = errors.New("simulated invalid block error") // Mock validation to fail
+
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Engine start failed: %v", err)
 	}
-	err = block2.Sign([]byte{}, privateKeyBytes)
-	if err == nil || !errors.Is(err, ErrMissingProposer) {
-		t.Errorf("Expected ErrMissingProposer for Sign with empty ProposerAddress, got %v", err)
+	defer engine.Stop()
+
+	// Simulate an incoming invalid block
+	txs := []core.Transaction{core.Transaction{ID: []byte("tx_inc_invalid1")}}
+	incomingInvalidBlock := core.NewBlock(1, mockBlockchain.lastBlockHash, txs)
+	incomingInvalidBlock.Timestamp = time.Now().UnixNano() + 10
+	incomingInvalidBlock.ProposerAddress = invalidProposerAddr
+	incomingInvalidBlock.Sign(invalidProposerAddr, []byte("dummy_privkey_invalid"))
+	incomingInvalidBlock.SetHash()
+
+	// Send the block to the engine's incoming channel
+	mockNet.recvChan <- incomingInvalidBlock
+
+	// Give time for the goroutine to process the block
+	time.Sleep(200 * time.Millisecond)
+
+	// Assertions: Chain height and state height should NOT change for invalid block
+	if mockBlockchain.ChainHeight() != 0 {
+		t.Errorf("Expected blockchain height to remain 0 for invalid block, got %d", mockBlockchain.ChainHeight())
 	}
-	
-	// Test with empty PrivateKeyBytes to Sign
-	err = block2.Sign(proposerAddressBytes, nil)
+	if mockState.CurrentHeight() != 0 {
+		t.Errorf("Expected consensus state height to remain 0 for invalid block, got %d", mockState.CurrentHeight())
+	}
+	_, err := mockBlockchain.GetBlockByHash(incomingInvalidBlock.Hash)
 	if err == nil {
-		t.Errorf("Expected error for Sign with nil PrivateKeyBytes")
+		t.Errorf("Expected invalid block NOT to be added, but it was found")
 	}
-	err = block2.Sign(proposerAddressBytes, []byte{})
+}
+
+func TestConsensusEngine_StartStop(t *testing.T) {
+	validatorAddr := []byte("validator_start_stop")
+	engine, _, _, _, _, _ := setupConsensusEngineTest(t, validatorAddr, 0) // Simplified setup
+
+	// Test Start
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Engine Start() failed: %v", err)
+	}
+	if !engine.isRunning.Load() { // Check atomic flag
+		t.Errorf("Engine.isRunning is false after Start()")
+	}
+	// Try starting again (should return error)
+	err := engine.Start()
+	if err == nil || !errors.Is(err, ErrEngineAlreadyRunning) {
+		t.Errorf("Expected ErrEngineAlreadyRunning on second Start(), got %v", err)
+	}
+
+	// Test Stop
+	if err := engine.Stop(); err != nil {
+		t.Fatalf("Engine Stop() failed: %v", err)
+	}
+	if engine.isRunning.Load() { // Check atomic flag
+		t.Errorf("Engine.isRunning is true after Stop()")
+	}
+	// Try stopping again (should return error)
+	err = engine.Stop()
+	if err == nil || !errors.Is(err, ErrEngineNotRunning) {
+		t.Errorf("Expected ErrEngineNotRunning on second Stop(), got %v", err)
+	}
+}
+
+// TestConsensusEngine_ProposeBlock_Failure simulates proposal failure and checks logging.
+func TestConsensusEngine_ProposeBlock_Failure(t *testing.T) {
+	validatorAddr := []byte("validator_fail_propose")
+	engine, mockNet, mockProposer, _, _, _ := setupConsensusEngineTest(t, validatorAddr, 0)
+	mockProposer.proposalErr = errors.New("simulated proposer error") // Mock proposer to fail
+
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Engine start failed: %v", err)
+	}
+	defer engine.Stop()
+
+	// Wait for the engineLoop to tick and call proposeBlock
+	time.Sleep(1500 * time.Millisecond) // Give enough time for the ticker to tick at least once
+
+	if mockProposer.proposalCounter == 0 {
+		t.Error("Expected proposerService.CreateProposalBlock to be called, was not.")
+	}
+	// Check that no block was broadcasted (as proposal failed)
+	if len(mockNet.GetBroadcastedBlocks()) > 0 {
+		t.Error("No block should have been broadcasted if proposal failed.")
+	}
+}
+
+// TestConsensusEngine_AddBlock_Failure simulates blockchain.AddBlock failing
+// and checks if the state is correctly not updated.
+func TestConsensusEngine_AddBlock_Failure(t *testing.T) {
+	validatorAddr := []byte("validator_fail_add")
+	engine, mockNet, _, _, mockState, mockBlockchain := setupConsensusEngineTest(t, validatorAddr, 0)
+	mockBlockchain.addBlockErr = errors.New("simulated add block failure") // Mock blockchain to fail on AddBlock
+
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Engine start failed: %v", err)
+	}
+	defer engine.Stop()
+
+	// Simulate an incoming valid block that blockchain.AddBlock will reject
+	txs := []core.Transaction{core.Transaction{ID: []byte("tx_add_fail")}}
+	incomingBlock := core.NewBlock(1, mockBlockchain.lastBlockHash, txs)
+	incomingBlock.Timestamp = time.Now().UnixNano() + 10
+	incomingBlock.ProposerAddress = []byte("other_proposer")
+	incomingBlock.Sign([]byte("other_proposer"), []byte("dummy_key"))
+	incomingBlock.SetHash()
+
+	mockNet.recvChan <- incomingBlock
+
+	time.Sleep(200 * time.Millisecond) // Give time for processing
+
+	// Assertions: Chain height and state height should NOT change (because AddBlock failed)
+	if mockBlockchain.ChainHeight() != 0 {
+		t.Errorf("Expected blockchain height to remain 0, got %d", mockBlockchain.ChainHeight())
+	}
+	if mockState.CurrentHeight() != 0 {
+		t.Errorf("Expected consensus state height to remain 0, got %d", mockState.CurrentHeight())
+	}
+	// Ensure the failing block was NOT added to the blockchain's internal map
+	_, err := mockBlockchain.GetBlockByHash(incomingBlock.Hash)
 	if err == nil {
-		t.Errorf("Expected error for Sign with empty PrivateKeyBytes")
-	}
-
-
-	// Tamper with ProposerAddress and expect verification to fail
-	originalProposer := block.ProposerAddress
-	block.ProposerAddress = []byte("tampered_proposer")
-	valid, err = block.VerifySignature()
-	if err == nil || !errors.Is(err, ErrInvalidSignature) { // Verify specific error for tampered signature
-		t.Errorf("Expected ErrInvalidSignature after tampering ProposerAddress, got %v (valid=%t)", err, valid)
-	}
-	if valid {
-		t.Errorf("block.VerifySignature() = true after tampering ProposerAddress; want false")
-	}
-	block.ProposerAddress = originalProposer // Restore
-
-	// Tamper with Signature and expect verification to fail
-	originalSignature := block.Signature
-	block.Signature = []byte("tampered_signature")
-	valid, err = block.VerifySignature()
-	if err == nil || !errors.Is(err, ErrInvalidSignature) { // Verify specific error
-		t.Errorf("Expected ErrInvalidSignature after tampering Signature, got %v (valid=%t)", err, valid)
-	}
-	if valid {
-		t.Errorf("block.VerifySignature() = true after tampering Signature; want false")
-	}
-	block.Signature = originalSignature // Restore
-
-	// Test with empty ProposerAddress for VerifySignature (should fail)
-	block.ProposerAddress = nil // Use nil for missing
-	_, err = block.VerifySignature()
-	if err == nil || !errors.Is(err, ErrMissingProposer) {
-		t.Errorf("Expected ErrMissingProposer for VerifySignature with nil ProposerAddress, got %v", err)
-	}
-	block.ProposerAddress = originalProposer // Restore
-
-	// Test with nil Signature for VerifySignature (should fail)
-	block.Signature = nil
-	_, err = block.VerifySignature()
-	if err == nil || !errors.Is(err, ErrMissingSignature) {
-		t.Errorf("Expected ErrMissingSignature for VerifySignature with nil Signature, got %v", err)
-	}
-	block.Signature = originalSignature // Restore
-}
-
-func TestBlockSetHash(t *testing.T) {
-	transactions := []Transaction{newDummyTx(StandardTx, "hash_test_tx", 1, 1)}
-	block := NewBlock(1, []byte("prev_hash_sethash"), transactions)
-	block.ProposerAddress = []byte("test_proposer") 
-	block.Timestamp = 1234567890 
-	block.AIAuditLog = []byte("dummy_ai_log") // EmPower1 specific
-
-	// Calculate hash first time
-	block.SetHash()
-	hash1 := make([]byte, len(block.Hash))
-	copy(hash1, block.Hash)
-
-	if len(hash1) == 0 {
-		t.Errorf("block.SetHash() resulted in empty hash")
-	}
-
-	// Call SetHash again, should be idempotent if fields haven't changed
-	block.SetHash()
-	if !bytes.Equal(hash1, block.Hash) {
-		t.Errorf("block.SetHash() is not idempotent. Hash1: %x, Hash2: %x", hash1, block.Hash)
-	}
-
-	// Change a field that's part of HeaderForSigning and expect hash to change
-	block.Transactions = []Transaction{newDummyTx(StimulusTx, "different_tx_data", 0, 1)} // Change transactions
-	block.SetHash()
-	hash2 := block.Hash
-	if bytes.Equal(hash1, hash2) {
-		t.Errorf("Block hash did not change after transactions modification. Hash1: %x, Hash2: %x", hash1, hash2)
-	}
-
-	// Change ProposerAddress, expect hash to change
-	block.ProposerAddress = []byte("another_proposer_hash")
-	block.SetHash()
-	hash3 := block.Hash
-	if bytes.Equal(hash2, hash3) {
-		t.Errorf("Block hash did not change after ProposerAddress modification. Hash2: %x, Hash3: %x", hash2, hash3)
-	}
-
-	// Change AIAuditLog, expect hash to change
-	block.AIAuditLog = []byte("new_ai_log")
-	block.SetHash()
-	hash4 := block.Hash
-	if bytes.Equal(hash3, hash4) {
-		t.Errorf("Block hash did not change after AIAuditLog modification. Hash3: %x, Hash4: %x", hash3, hash4)
-	}
-
-	t.Logf("TestBlockSetHash: Hash1: %s", hex.EncodeToString(hash1))
-	t.Logf("TestBlockSetHash: Hash2 (after tx change): %s", hex.EncodeToString(hash2))
-	t.Logf("TestBlockSetHash: Hash3 (after proposer change): %s", hex.EncodeToString(hash3))
-	t.Logf("TestBlockSetHash: Hash4 (after AI log change): %s", hex.EncodeToString(hash4))
-}
-
-func TestBlockHeaderForSigning(t *testing.T) {
-	transactions := []Transaction{
-		newDummyTx(StandardTx, "header_tx1", 1, 1),
-		newDummyTx(TaxTx, "header_tx2", 1, 1), // EmPower1 specific TxType
-	}
-	block := NewBlock(1, []byte("prev_hash_header"), transactions)
-	block.ProposerAddress = []byte("test_proposer_header")
-	block.Timestamp = 9876543210
-	block.AIAuditLog = []byte("audit_log_header")
-
-	headerBytes1 := block.HeaderForSigning()
-	if len(headerBytes1) == 0 {
-		t.Errorf("block.HeaderForSigning() returned empty slice")
-	}
-
-	// Change transactions, expect HeaderForSigning to change
-	block.Transactions = []Transaction{newDummyTx(StimulusTx, "new_header_tx", 0, 1)}
-	headerBytes2 := block.HeaderForSigning()
-	if bytes.Equal(headerBytes1, headerBytes2) {
-		t.Errorf("HeaderForSigning did not change after transactions modification")
-	}
-
-	// Change ProposerAddress, expect HeaderForSigning to change
-	block.ProposerAddress = []byte("another_proposer_header")
-	headerBytes3 := block.HeaderForSigning()
-	if bytes.Equal(headerBytes2, headerBytes3) {
-		t.Errorf("HeaderForSigning did not change after ProposerAddress modification")
-	}
-
-	// Change AIAuditLog, expect HeaderForSigning to change
-	block.AIAuditLog = []byte("new_audit_log_header")
-	headerBytes4 := block.HeaderForSigning()
-	if bytes.Equal(headerBytes3, headerBytes4) {
-		t.Errorf("HeaderForSigning did not change after AIAuditLog modification")
+		t.Errorf("Expected failing block NOT to be found in blockchain, but it was.")
 	}
 }
 
-func TestBlockValidateTransactions(t *testing.T) {
-    // Test case 1: Valid transactions (basic check)
-    block1 := NewBlock(1, []byte("prev_hash_valid"), []Transaction{
-        newDummyTx(StandardTx, "valid_tx1", 1, 1),
-        newDummyTx(StimulusTx, "valid_tx2", 0, 1),
-    })
-    err := block1.ValidateTransactions()
-    if err != nil {
-        t.Errorf("Expected no error for valid transactions, got %v", err)
-    }
+// TestConsensusEngine_UpdateHeight_Failure simulates consensusState.UpdateHeight failing
+// after a block has been added to the blockchain.
+func TestConsensusEngine_UpdateHeight_Failure(t *testing.T) {
+	validatorAddr := []byte("validator_fail_update_height")
+	engine, mockNet, _, _, mockState, mockBlockchain := setupConsensusEngineTest(t, validatorAddr, 0)
 
-    // Test case 2: Transaction with empty ID (should fail)
-    txWithEmptyID := newDummyTx(StandardTx, "empty_id_tx", 1, 1)
-    txWithEmptyID.ID = []byte{} // Tamper with ID
-    block2 := NewBlock(2, []byte("prev_hash_invalid"), []Transaction{txWithEmptyID})
-    err = block2.ValidateTransactions()
-    if err == nil {
-        t.Errorf("Expected error for transaction with empty ID, got none")
-    }
-    expectedErr := "transaction 0 has no ID"
-    if err != nil && err.Error() != expectedErr {
-        t.Errorf("Expected error message '%s', got '%s'", expectedErr, err.Error())
-    }
+	// Inject a mock for UpdateHeight that simulates failure
+	originalUpdateHeight := mockState.UpdateHeight
+	updateHeightCalled := make(chan bool, 1)
+	mockState.UpdateHeight = func(height int64) error {
+		updateHeightCalled <- true
+		return errors.New("simulated UpdateHeight error")
+	}
 
-    // Test case 3: Conceptual AI/ML flagging (requires actual AI integration)
-    // This test case cannot be fully implemented without the actual ai_ml_module.
-    // It would involve:
-    //   - Mocking ai_ml_module.AnalyzeTransactions to return a specific verdict.
-    //   - Creating a transaction that the mock would flag.
-    //   - Asserting that ValidateTransactions returns the expected error/flag.
-    // For now, this remains a conceptual test.
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Engine start failed: %v", err)
+	}
+	defer engine.Stop()
+	defer func() { mockState.UpdateHeight = originalUpdateHeight }() // Restore original mock after test
+
+	// Simulate an incoming block that passes validation and AddBlock, but fails UpdateHeight
+	txs := []core.Transaction{core.Transaction{ID: []byte("tx_update_fail")}}
+	incomingBlock := core.NewBlock(1, mockBlockchain.lastBlockHash, txs)
+	incomingBlock.Timestamp = time.Now().UnixNano() + 10
+	incomingBlock.ProposerAddress = []byte("other_proposer_2")
+	incomingBlock.Sign([]byte("other_proposer_2"), []byte("dummy_key_2"))
+	incomingBlock.SetHash()
+
+	// Crucial: Need to ensure blockchain.AddBlock succeeds so UpdateHeight is called.
+	// Temporarily unset addBlockErr if it was set by a previous test.
+	mockBlockchain.addBlockErr = nil 
+
+	mockNet.recvChan <- incomingBlock
+
+	time.Sleep(200 * time.Millisecond) // Give time for processing
+
+	// Assertions: Blockchain height should have updated, but ConsensusState height should NOT
+	if mockBlockchain.ChainHeight() != 1 {
+		t.Errorf("Expected blockchain height to be 1, got %d", mockBlockchain.ChainHeight())
+	}
+	// This is the key check: ConsensusState height should remain 0 because UpdateHeight failed
+	if mockState.CurrentHeight() != 0 { // This confirms the mock's UpdateHeight was called and failed
+		t.Errorf("Expected consensus state height to remain 0, got %d", mockState.CurrentHeight())
+	}
+	// Verify UpdateHeight was actually called
+	select {
+	case <-updateHeightCalled:
+		// Success, the mock was called
+	case <-time.After(50 * time.Millisecond):
+		t.Error("Expected UpdateHeight to be called, but it wasn't.")
+	}
 }

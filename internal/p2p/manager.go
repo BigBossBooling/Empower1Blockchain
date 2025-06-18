@@ -1,12 +1,11 @@
 package p2p
 
 import (
-	"bytes"
 	"encoding/hex"
 	"errors" // Explicitly import errors
 	"fmt"
-	"log"    // For structured logging
-	"os"     // For log output
+	"log" // For structured logging
+	"os"  // For log output
 	"sync"
 	"time"
 
@@ -23,29 +22,29 @@ var (
 )
 
 const (
-	minDesiredPeers    = 5             // Minimum number of active connections to maintain
-	maxDesiredPeers    = 10            // Maximum number of active connections
-	peerDiscoveryInterval = 30 * time.Second // How often to attempt peer discovery
+	minDesiredPeers           = 5                // Minimum number of active connections to maintain
+	maxDesiredPeers           = 10               // Maximum number of active connections
+	peerDiscoveryInterval     = 30 * time.Second // How often to attempt peer discovery
 	peerLivenessCheckInterval = 15 * time.Second // How often to check peer liveness
-	maxPeerDiscoveryAttempts = 3       // How many times to try connecting to a new discovered peer
-	reconnectDelay         = 5 * time.Second // Delay before reconnecting to a known peer
+	maxPeerDiscoveryAttempts  = 3                // How many times to try connecting to a new discovered peer
+	reconnectDelay            = 5 * time.Second  // Delay before reconnecting to a known peer
 )
 
 // NetworkManager orchestrates peer discovery, connection management, and message routing.
 // It acts as the central control plane for the P2P network.
 type NetworkManager struct {
-	server        *Server             // The underlying P2P Server handling connections
-	selfNodeID    []byte              // Our node's cryptographic ID
-	knownAddresses map[string][]byte  // All known peer addresses -> Peer ID (for discovery)
-	activePeers   map[string]*Peer   // Currently active connections, keyed by address
+	server         *Server           // The underlying P2P Server handling connections
+	selfNodeID     []byte            // Our node's cryptographic ID
+	knownAddresses map[string][]byte // All known peer addresses -> Peer ID (for discovery)
+	activePeers    map[string]*Peer  // Currently active connections, keyed by address
 
-	incomingBlocks  chan *core.Block     // Channel for blocks from network to consensus engine
-	incomingTxs     chan *core.Transaction // Channel for transactions from network to mempool
+	incomingBlocks chan *core.Block       // Channel for blocks from network to consensus engine
+	incomingTxs    chan *core.Transaction // Channel for transactions from network to mempool
 
-	stopChan      chan struct{}       // Signal to stop manager goroutines
-	isRunning     bool                // Flag indicating running status
-	wg            sync.WaitGroup      // WaitGroup for manager goroutines
-	logger        *log.Logger         // Dedicated logger for the NetworkManager
+	stopChan  chan struct{}  // Signal to stop manager goroutines
+	isRunning bool           // Flag indicating running status
+	wg        sync.WaitGroup // WaitGroup for manager goroutines
+	logger    *log.Logger    // Dedicated logger for the NetworkManager
 }
 
 // NewNetworkManager creates a new NetworkManager instance.
@@ -64,18 +63,18 @@ func NewNetworkManager(server *Server, selfNodeID []byte, blockChanBuffer, txCha
 	logger := log.New(os.Stdout, "NET_MANAGER: ", log.Ldate|log.Ltime|log.Lshortfile)
 
 	nm := &NetworkManager{
-		server:        server,
-		selfNodeID:    selfNodeID,
+		server:         server,
+		selfNodeID:     selfNodeID,
 		knownAddresses: make(map[string][]byte),
-		activePeers:   make(map[string]*Peer),
-		
+		activePeers:    make(map[string]*Peer),
+
 		incomingBlocks: make(chan *core.Block, blockChanBuffer),
 		incomingTxs:    make(chan *core.Transaction, txChanBuffer),
 
-		stopChan:      make(chan struct{}),
-		isRunning:     false,
-		wg:            sync.WaitGroup{},
-		logger:        logger,
+		stopChan:  make(chan struct{}),
+		isRunning: false,
+		wg:        sync.WaitGroup{},
+		logger:    logger,
 	}
 
 	// Set up callbacks on the underlying Server (critical for synchronization)
@@ -116,11 +115,11 @@ func (nm *NetworkManager) Stop() error {
 		return ErrManagerNotRunning
 	}
 
-	close(nm.stopChan)     // Signal manager goroutines to stop
-	nm.wg.Wait()           // Wait for manager goroutines to finish
+	close(nm.stopChan) // Signal manager goroutines to stop
+	nm.wg.Wait()       // Wait for manager goroutines to finish
 
 	// Stop the underlying P2P server
-	nm.server.Stop() 
+	nm.server.Stop()
 
 	// Close outgoing channels (if any) and incoming public channels
 	close(nm.incomingBlocks)
@@ -211,10 +210,10 @@ func (nm *NetworkManager) handlePeerConnected(p *Peer) {
 	nm.activePeers[p.Address()] = p // Add to active peers map
 	nm.mu.Unlock()
 	nm.logger.Printf("NETWORK_MANAGER: Peer connected: %s (ID: %x). Total active: %d", p.Address(), p.ID(), len(nm.activePeers))
-	
+
 	// Add its address to our knownAddresses if not already there
 	nm.AddKnownAddress(p.Address(), p.ID()) // This handles internal locking
-	
+
 	// Request peer list from newly connected peer for further discovery
 	// This is important for initial network graph building
 	if err := nm.server.sendRequestPeerList(p); err != nil { // Assuming sendRequestPeerList is public or a callback is available
@@ -333,7 +332,7 @@ func (nm *NetworkManager) discoverAndConnect() {
 
 	// Shuffle addresses to randomize connection attempts
 	// rand.Shuffle(len(addressesToTry), func(i, j int) { addressesToTry[i], addressesToTry[j] = addressesToTry[j], addressesToTry[i] })
-	
+
 	// Try to connect to a few new peers if below desired peer count
 	connectionsMade := 0
 	for _, addr := range addressesToTry {
@@ -345,7 +344,7 @@ func (nm *NetworkManager) discoverAndConnect() {
 		}
 
 		nodeID, _ := nm.knownAddresses[addr] // Get associated ID (might be nil if only address was known)
-		
+
 		// Connect asynchronously to avoid blocking the loop
 		go func(address string, id []byte) {
 			nm.logger.Debugf("NETWORK_MANAGER: Attempting connection to %s (ID: %x)...", address, id)
@@ -370,7 +369,7 @@ func (nm *NetworkManager) discoverAndConnect() {
 // pruneStaleConnections checks active peers for liveness and disconnects stale ones.
 func (nm *NetworkManager) pruneStaleConnections() {
 	nm.logger.Debug("NETWORK_MANAGER: Running connection maintenance...")
-	
+
 	nm.mu.RLock()
 	peersToCheck := make([]*Peer, 0, len(nm.activePeers))
 	for _, p := range nm.activePeers {
@@ -380,7 +379,7 @@ func (nm *NetworkManager) pruneStaleConnections() {
 
 	for _, p := range peersToCheck {
 		if time.Since(p.GetLastActivity()) > 3*peerLivenessCheckInterval { // If no activity for a while
-			nm.logger.Printf("NETWORK_MANAGER: Peer %s (ID: %x) appears stale. Last activity: %s. Disconnecting.", 
+			nm.logger.Printf("NETWORK_MANAGER: Peer %s (ID: %x) appears stale. Last activity: %s. Disconnecting.",
 				p.Address(), p.ID(), p.GetLastActivity().Format(time.RFC3339))
 			// Remove peer (this also closes connection)
 			if err := nm.server.removePeer(p); err != nil { // Assuming Server has a public removePeer method
@@ -416,57 +415,57 @@ func (nm *NetworkManager) gossipTransaction(tx *core.Transaction, originalSender
 // SendBlockToPeer sends a specific block to a specific peer.
 // Useful for block requests/responses during sync.
 func (nm *NetworkManager) SendBlockToPeer(block *core.Block, peerID []byte) error {
-    peer := nm.server.GetPeerByID(peerID) // Assuming Server has a GetPeerByID method
-    if peer == nil {
-        return fmt.Errorf("%w: peer %x not found to send block", ErrPeerNotFound, peerID)
-    }
-    blockBytes, err := block.SerializeToBytes() // Assuming Block.SerializeToBytes()
-    if err != nil {
-        return fmt.Errorf("%w: failed to serialize block for sending: %v", ErrMessageSerialization, err)
-    }
-    msg := NewMessage(MsgBlockResponse, nm.selfNodeID, blockBytes)
-    return nm.server.sendMessage(peer, msg) // Use internal Server.sendMessage
+	peer := nm.server.GetPeerByID(peerID) // Assuming Server has a GetPeerByID method
+	if peer == nil {
+		return fmt.Errorf("%w: peer %x not found to send block", ErrPeerNotFound, peerID)
+	}
+	blockBytes, err := block.SerializeToBytes() // Assuming Block.SerializeToBytes()
+	if err != nil {
+		return fmt.Errorf("%w: failed to serialize block for sending: %v", ErrMessageSerialization, err)
+	}
+	msg := NewMessage(MsgBlockResponse, nm.selfNodeID, blockBytes)
+	return nm.server.sendMessage(peer, msg) // Use internal Server.sendMessage
 }
 
 // RequestBlockFromPeer requests a specific block from a peer.
 func (nm *NetworkManager) RequestBlockFromPeer(peerID []byte, blockHash []byte, height int64) error {
-    peer := nm.server.GetPeerByID(peerID)
-    if peer == nil {
-        return fmt.Errorf("%w: peer %x not found to request block", ErrPeerNotFound, peerID)
-    }
-    payload := BlockRequestPayload{BlockHash: blockHash, Height: height}
-    payloadBytes, err := EncodePayload(payload)
-    if err != nil {
-        return fmt.Errorf("%w: failed to encode block request payload: %v", ErrPayloadEncoding, err)
-    }
-    msg := NewMessage(MsgBlockRequest, nm.selfNodeID, payloadBytes)
-    return nm.server.sendMessage(peer, msg)
+	peer := nm.server.GetPeerByID(peerID)
+	if peer == nil {
+		return fmt.Errorf("%w: peer %x not found to request block", ErrPeerNotFound, peerID)
+	}
+	payload := BlockRequestPayload{BlockHash: blockHash, Height: height}
+	payloadBytes, err := EncodePayload(payload)
+	if err != nil {
+		return fmt.Errorf("%w: failed to encode block request payload: %v", ErrPayloadEncoding, err)
+	}
+	msg := NewMessage(MsgBlockRequest, nm.selfNodeID, payloadBytes)
+	return nm.server.sendMessage(peer, msg)
 }
 
 // SendVoteToPeer sends a block vote message to a specific peer.
 func (nm *NetworkManager) SendVoteToPeer(vote *BlockVotePayload, peerID []byte) error {
-    peer := nm.server.GetPeerByID(peerID)
-    if peer == nil {
-        return fmt.Errorf("%w: peer %x not found to send vote", ErrPeerNotFound, peerID)
-    }
-    payloadBytes, err := EncodePayload(vote)
-    if err != nil {
-        return fmt.Errorf("%w: failed to encode vote payload: %v", ErrPayloadEncoding, err)
-    }
-    msg := NewMessage(MsgBlockVote, nm.selfNodeID, payloadBytes)
-    return nm.server.sendMessage(peer, msg)
+	peer := nm.server.GetPeerByID(peerID)
+	if peer == nil {
+		return fmt.Errorf("%w: peer %x not found to send vote", ErrPeerNotFound, peerID)
+	}
+	payloadBytes, err := EncodePayload(vote)
+	if err != nil {
+		return fmt.Errorf("%w: failed to encode vote payload: %v", ErrPayloadEncoding, err)
+	}
+	msg := NewMessage(MsgBlockVote, nm.selfNodeID, payloadBytes)
+	return nm.server.sendMessage(peer, msg)
 }
 
 // SendTransactionToPeer sends a specific transaction to a specific peer.
 func (nm *NetworkManager) SendTransactionToPeer(tx *core.Transaction, peerID []byte) error {
-    peer := nm.server.GetPeerByID(peerID)
-    if peer == nil {
-        return fmt.Errorf("%w: peer %x not found to send transaction", ErrPeerNotFound, peerID)
-    }
-    txBytes, err := tx.Serialize() // Assuming Transaction.Serialize()
-    if err != nil {
-        return fmt.Errorf("%w: failed to serialize transaction for sending: %v", ErrMessageSerialization, err)
-    }
-    msg := NewMessage(MsgNewTransaction, nm.selfNodeID, txBytes)
-    return nm.server.sendMessage(peer, msg)
+	peer := nm.server.GetPeerByID(peerID)
+	if peer == nil {
+		return fmt.Errorf("%w: peer %x not found to send transaction", ErrPeerNotFound, peerID)
+	}
+	txBytes, err := tx.Serialize() // Assuming Transaction.Serialize()
+	if err != nil {
+		return fmt.Errorf("%w: failed to serialize transaction for sending: %v", ErrMessageSerialization, err)
+	}
+	msg := NewMessage(MsgNewTransaction, nm.selfNodeID, txBytes)
+	return nm.server.sendMessage(peer, msg)
 }

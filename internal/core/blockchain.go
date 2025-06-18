@@ -1,175 +1,204 @@
-package core
+package consensus
 
 import (
 	"bytes"
-	"errors" // For specific error types
+	"context"
+	"errors"
 	"fmt"
-	"log"    // For structured logging
+	"log"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	// Potentially for crypto if not in Block directly
-	// "crypto/rand"
-	// "crypto/ed25519"
-	// "encoding/hex"
+	"empower1.com/core/core"
 )
 
-// Define custom errors for the Blockchain manager, ensuring clear failure states.
+// Define custom errors for the consensus engine, ensuring clear failure states.
 var (
-	ErrBlockchainEmpty       = errors.New("blockchain is empty")
-	ErrBlockNotFound         = errors.New("block not found")
-	ErrInvalidBlockHeight    = errors.New("invalid block height")
-	ErrInvalidPrevBlockHash  = errors.New("invalid previous block hash")
-	ErrBlockAlreadyExists    = errors.New("block with this hash already exists")
-	ErrGenesisBlockMalformed = errors.New("genesis block malformed")
+	ErrEngineAlreadyRunning = errors.New("consensus engine is already running")
+	ErrEngineNotRunning     = errors.New("consensus engine is not running")
+	ErrInvalidEngineConfig  = errors.New("invalid consensus engine configuration")
+	ErrFailedToGetLastBlock = errors.New("failed to get last block from blockchain")
+	ErrFailedToGetProposer  = errors.New("failed to get proposer for height")
+	ErrProposeBlockFailed   = errors.New("failed to propose block")
+	ErrIncomingBlockInvalid = errors.New("incoming block is invalid")
+	ErrFailedToAddBlock     = errors.New("failed to add block to blockchain")
 )
 
-// Blockchain represents the chain of blocks.
-// It's designed as an in-memory representation for core logic, but production
-// would require persistent storage (e.g., database integration).
-type Blockchain struct {
-	mu         sync.RWMutex        // Mutex for concurrent access to blocks and blockIndex
-	blocks     []*Block            // Ordered list of blocks in the chain
-	blockIndex map[string]*Block   // For quick lookup of blocks by their hash
-	logger     *log.Logger         // Dedicated logger for the blockchain instance
+// SimulatedNetwork interface represents the network layer for block propagation.
+type SimulatedNetwork interface {
+	BroadcastBlock(block *core.Block) error
+	ReceiveBlocks() <-chan *core.Block
 }
 
-// NewBlockchain creates a new Blockchain instance and initializes it with a genesis block.
-// This is the genesis point of our digital ecosystem.
-func NewBlockchain() *Blockchain {
-	// Initialize a logger for the blockchain instance
-	logger := log.New(os.Stdout, "BLOCKCHAIN: ", log.Ldate|log.Ltime|log.Lshortfile)
+// ConsensusEngine is the core struct managing the consensus process.
+// It orchestrates block proposal, validation, and state updates.
+type ConsensusEngine struct {
+	validatorAddress  string             // Address of the validator node
+	isValidator       bool               // Flag indicating if this instance is a validator
+	proposerService   *ProposerService   // Service responsible for proposing new blocks
+	validationService *ValidationService // Service responsible for validating blocks
+	consensusState    *ConsensusState    // Current state of the consensus process
+	blockchain        *core.Blockchain   // Reference to the blockchain
+	network           SimulatedNetwork   // Network interface for block broadcasting and receiving
 
-	bc := &Blockchain{
-		blocks:     make([]*Block, 0),
-		blockIndex: make(map[string]*Block),
-		logger:     logger,
+	ctx       context.Context    // Context for managing lifecycle
+	cancel    context.CancelFunc // Cancel function to stop the context
+	wg        sync.WaitGroup     // WaitGroup to manage goroutine lifecycles
+	logger    *log.Logger        // Logger for the consensus engine
+	isRunning atomic.Bool        // Atomic flag indicating if the engine is running
+	startOnce sync.Once          // Ensures Start() logic is only executed once
+	stopOnce  sync.Once          // Ensures Stop() logic is only executed once
+}
+
+// NewConsensusEngine creates a new instance of ConsensusEngine with the provided services and blockchain reference.
+// It initializes the logger and context, and checks if the provided configuration is valid.
+func NewConsensusEngine(
+	validatorAddress string,
+	proposerService *ProposerService,
+	validationService *ValidationService,
+	consensusState *ConsensusState,
+	blockchain *core.Blockchain,
+	network SimulatedNetwork,
+) (*ConsensusEngine, error) {
+	if proposerService == nil || validationService == nil || consensusState == nil || blockchain == nil || network == nil {
+		return nil, fmt.Errorf("%w: all core services must be provided", ErrInvalidEngineConfig)
 	}
+	isValidator := (proposerService != nil && proposerService.validatorAddress == validatorAddress)
+	logger := log.New(os.Stdout, "CONSENSUS_ENGINE: ", log.Ldate|log.Ltime|log.Lshortfile)
+	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create and add the genesis block during initialization, ensuring "Know Your Core, Keep it Clear".
-	genesis, err := bc.createGenesisBlock()
+	engine := &ConsensusEngine{
+		validatorAddress:  validatorAddress,
+		isValidator:       isValidator,
+		proposerService:   proposerService,
+		validationService: validationService,
+		consensusState:    consensusState,
+		blockchain:        blockchain,
+		network:           network,
+		logger:            logger,
+		ctx:               ctx,
+		cancel:            cancel,
+	}
+	engine.logger.Println("ConsensusEngine initialized.")
+	return engine, nil
+}
+
+// Start begins the consensus engine's operation, launching the engine loop and block processing goroutines.
+// It ensures that the engine is not already running before starting.
+func (ce *ConsensusEngine) Start() error {
+	var err error
+	ce.startOnce.Do(func() {
+		if ce.isRunning.Load() {
+			err = ErrEngineAlreadyRunning
+			return
+		}
+		ce.isRunning.Store(true)
+		ce.wg.Add(2)
+		go ce.startEngineLoop()
+		go ce.processIncomingBlocks()
+		ce.logger.Println("ConsensusEngine started.")
+	})
+	return err
+}
+
+// Stop gracefully shuts down the consensus engine, stopping the engine loop and block processing goroutines.
+// It ensures that the engine is currently running before stopping.
+func (ce *ConsensusEngine) Stop() error {
+	var err error
+	ce.stopOnce.Do(func() {
+		if !ce.isRunning.Load() {
+			err = ErrEngineNotRunning
+			return
+		}
+		ce.cancel()
+		ce.wg.Wait()
+		ce.isRunning.Store(false)
+		ce.logger.Println("ConsensusEngine stopped.")
+	})
+	return err
+}
+
+// startEngineLoop is the main loop for the consensus engine, running at regular intervals.
+// It checks if it's the validator's turn to propose a new block and triggers the block proposal process if so.
+func (ce *ConsensusEngine) startEngineLoop() {
+	defer ce.wg.Done()
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	ce.logger.Println("Engine loop started.")
+
+	for {
+		select {
+		case <-ce.ctx.Done():
+			ce.logger.Println("Engine loop received stop signal.")
+			return
+		case <-ticker.C:
+			currentChainHeight := ce.blockchain.ChainHeight()
+			if currentChainHeight == -1 {
+				ce.logger.Println("Blockchain is empty, waiting for genesis block to sync or be created.")
+				continue
+			}
+			nextBlockHeight := currentChainHeight + 1
+			expectedProposer, err := ce.consensusState.GetProposerForHeight(nextBlockHeight)
+			if err != nil {
+				ce.logger.Printf("Failed to get proposer for height %d: %v", nextBlockHeight, err)
+				continue
+			}
+			if ce.isValidator && bytes.Equal([]byte(ce.validatorAddress), expectedProposer.Address) {
+				ce.logger.Printf("It's OUR turn to propose block #%d!", nextBlockHeight)
+				if err := ce.proposeBlock(nextBlockHeight); err != nil {
+					ce.logger.Printf("Failed to propose block #%d: %v", nextBlockHeight, err)
+				}
+			}
+		}
+	}
+}
+
+// proposeBlock handles the block proposal process for the validator.
+// It creates a new proposal block based on the last block in the chain and broadcasts it to the network.
+func (ce *ConsensusEngine) proposeBlock(height int64) error {
+	lastBlock, err := ce.blockchain.GetLastBlock()
 	if err != nil {
-		// If genesis block creation fails, the blockchain cannot be initialized.
-		// This is a critical failure, so we panic or return an error from NewBlockchain.
-		panic(fmt.Sprintf("Failed to create genesis block: %v", err))
+		return fmt.Errorf("%w: %v", ErrFailedToGetLastBlock, err)
 	}
-	
-	// AddBlock handles locking and indexing
-	if err := bc.AddBlock(genesis); err != nil {
-		// This should not happen for a valid, first genesis block, but good for robustness.
-		panic(fmt.Sprintf("Failed to add genesis block to blockchain: %v", err))
-	}
-	bc.logger.Printf("Genesis Block added. Hash: %x. Height: %d\n", genesis.Hash, genesis.Height)
-	return bc
-}
-
-// createGenesisBlock creates the very first block in the blockchain.
-// It's a special block with specific, fixed parameters.
-func (bc *Blockchain) createGenesisBlock() (*Block, error) {
-	// Genesis block data is typically fixed and known.
-	// For EmPower1, it might contain initial distribution or a manifest of rules.
-	genesisTransactions := []Transaction{
-		// Example: A special initial distribution or rule-setting transaction
-		newDummyTx(StandardTx, "EmPower1_Genesis_Distribution_Tx", 0, 0),
-	}
-	
-	genesisBlock := NewBlock(0, bytes.Repeat([]byte{0x00}, sha256.Size), genesisTransactions) // PrevHash is all zeros
-	
-	// Genesis proposer and signature are often hardcoded or set by a trusted entity.
-	// This ensures the chain's origin is undeniable.
-	genesisProposerAddress := []byte("EmPower1GenesisProposer") // A fixed, known address
-	genesisPrivateKey := []byte("hardcoded_genesis_private_key") // Use actual private key in production
-
-	// Sign the genesis block
-	if err := genesisBlock.Sign(genesisProposerAddress, genesisPrivateKey); err != nil {
-		return nil, fmt.Errorf("failed to sign genesis block: %w", err)
-	}
-	
-	genesisBlock.SetHash() // Calculate hash after all fields are set
-
-	if genesisBlock.Hash == nil || len(genesisBlock.Hash) != sha256.Size {
-		return nil, ErrGenesisBlockMalformed // Ensure hash is correctly set
-	}
-	
-	// Conceptual: Genesis block might also contain an initial AI audit log specific to its creation
-	// genesisBlock.AIAuditLog, _ = ai_ml_module.GenerateAIAuditLog(genesisBlock)
-
-	bc.logger.Printf("Genesis Block conceptually created. Hash: %x\n", genesisBlock.Hash)
-	return genesisBlock, nil
-}
-
-// AddBlock appends a block to the blockchain after basic validation.
-// It assumes the block has already undergone full consensus validation by the PoS engine.
-// This function is critical for maintaining chain integrity.
-func (bc *Blockchain) AddBlock(block *Block) error {
-	bc.mu.Lock() // Ensure thread-safe access
-	defer bc.mu.Unlock()
-
-	// 1. Check for duplicate block hash early (efficient preliminary check).
-	if _, exists := bc.blockIndex[string(block.Hash)]; exists {
-		bc.logger.Printf("BLOCK_ADD_ERROR: Block with hash %x already exists. Height: %d", block.Hash, block.Height)
-		return ErrBlockAlreadyExists
-	}
-
-	// 2. Validate block structure and cryptographic integrity.
-	// These checks are fundamental for "Sense the Landscape, Secure the Solution".
-	if block.Hash == nil || len(block.Hash) != sha256.Size {
-		return fmt.Errorf("block hash is nil or invalid length: %x", block.Hash)
-	}
-	// Verify the block's own hash is correctly calculated (optional, as SetHash should ensure this)
-	// tempBlock := *block
-	// tempBlock.Hash = nil // Clear hash for recalculation
-	// tempBlock.SetHash()
-	// if !bytes.Equal(block.Hash, tempBlock.Hash) {
-	// 	return fmt.Errorf("block's calculated hash (%x) does not match provided hash (%x)", tempBlock.Hash, block.Hash)
-	// }
-
-	// Verify the block's signature using its proposer address.
-	isValidSignature, err := block.VerifySignature()
+	proposal, err := ce.proposerService.CreateProposalBlock(height, lastBlock.Hash, lastBlock.Timestamp)
 	if err != nil {
-		return fmt.Errorf("signature verification failed for block %d (%x): %w", block.Height, block.Hash, err)
+		return fmt.Errorf("%w: %v", ErrProposeBlockFailed, err)
 	}
-	if !isValidSignature {
-		return ErrInvalidSignature
+	if err := ce.network.BroadcastBlock(proposal); err != nil {
+		return fmt.Errorf("failed to broadcast proposed block %d: %w", height, err)
 	}
-
-	// 3. Validate chain continuity for non-genesis blocks.
-	if len(bc.blocks) > 0 { // For any block after genesis
-		lastBlock := bc.blocks[len(bc.blocks)-1]
-		
-		// Ensure height is sequential.
-		if block.Height != lastBlock.Height+1 {
-			bc.logger.Printf("BLOCK_ADD_ERROR: Invalid block height. Expected %d, got %d (last %d). Block hash: %x", lastBlock.Height+1, block.Height, lastBlock.Height, block.Hash)
-			return ErrInvalidBlockHeight
-		}
-		// Ensure previous block hash matches the last block in the chain.
-		if !bytes.Equal(block.PrevBlockHash, lastBlock.Hash) {
-			bc.logger.Printf("BLOCK_ADD_ERROR: Invalid previous block hash. Expected %x, got %x. Block hash: %x", lastBlock.Hash, block.PrevBlockHash, block.Hash)
-			return ErrInvalidPrevBlockHash
-		}
-		// Validate transactions within the block (e.g., basic format, IDs, AI flags)
-		if err := block.ValidateTransactions(); err != nil { // This is where AI/ML flagging comes in
-			bc.logger.Printf("BLOCK_ADD_ERROR: Transaction validation failed for block %d (%x): %v", block.Height, block.Hash, err)
-			return fmt.Errorf("transaction validation failed: %w", err)
-		}
-
-	} else { // This is explicitly for the genesis block
-		if block.Height != 0 {
-			return ErrInvalidBlockHeight // Genesis must be height 0
-		}
-		// For genesis, PrevBlockHash should be a specific zero hash or genesis hash,
-		// already handled by createGenesisBlock. No need to check against lastBlock.
-	}
-
-	// 4. Add the block to the chain and index. This is the "Iterate Intelligently" step.
-	bc.blocks = append(bc.blocks, block)
-	bc.blockIndex[string(block.Hash)] = block
-	
-	bc.logger.Printf("BLOCK: Block #%d (%x) added to blockchain. PrevHash: %x. Proposer: %x\n", block.Height, block.Hash, block.PrevBlockHash, block.ProposerAddress)
+	ce.logger.Printf("Proposed and broadcasted block #%d (%x).", proposal.Height, proposal.Hash)
 	return nil
 }
 
-// GetBlockByHeight returns the block at a given height.
-func (bc *Blockchain) GetBlockByHeight(height int64) (*Block, error) {
-	bc.mu.RLock() // Read-lock for safe concurrent access
-	defer bc.mu.RUnlock()
+// processIncomingBlocks handles the reception and processing of incoming blocks from the network.
+// It validates and adds the blocks to the blockchain, and updates the consensus state.
+func (ce *ConsensusEngine) processIncomingBlocks() {
+	defer ce.wg.Done()
+	ce.logger.Println("Incoming block processor started.")
+
+	for {
+		select {
+		case <-ce.ctx.Done():
+			ce.logger.Println("Incoming block processor received stop signal.")
+			return
+		case incomingBlock := <-ce.network.ReceiveBlocks():
+			ce.logger.Printf("Received block #%d (%x) from network. Proposer: %x",
+				incomingBlock.Height, incomingBlock.Hash, incomingBlock.ProposerAddress)
+			if err := ce.validationService.ValidateBlock(incomingBlock); err != nil {
+				ce.logger.Printf("Incoming block #%d (%x) is INVALID: %v", incomingBlock.Height, incomingBlock.Hash, err)
+				continue
+			}
+			if err := ce.blockchain.AddBlock(incomingBlock); err != nil {
+				ce.logger.Printf("Failed to add validated block #%d (%x) to blockchain: %v", incomingBlock.Height, incomingBlock.Hash, err)
+				continue
+			}
+			if err := ce.consensusState.UpdateHeight(incomingBlock.Height); err != nil {
+				ce.logger.Printf("Failed to update consensus state height after adding block %d: %v", incomingBlock.Height, err)
+			}
+		}
+	}
+}

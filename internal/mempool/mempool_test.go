@@ -1,15 +1,15 @@
 package mempool
 
 import (
-	"bytes"
-	"encoding/gob" // For TestMempoolPruneByBlockchain
+
+	// For TestMempoolPruneByBlockchain
 	"encoding/hex"
 	"errors"
-	"fmt"
+	"strings"
 	"testing"
 	"time"
 
-	"empower1.com/core/core"    // Assuming this path to core package
+	"empower1.com/core/core"   // Assuming this path to core package
 	"empower1.com/core/crypto" // Assuming this path to crypto package for key generation
 )
 
@@ -39,14 +39,16 @@ func newTestSignedTransaction(t *testing.T, amount uint64, txType core.TxType) *
 		tx, err = core.NewStandardTransaction(senderPubKey, receiverPubKeyBytes, amount, 10) // Fixed fee for simplicity
 	case core.StimulusTx: // Stimulus txs typically have no sender input, just outputs
 		tx, err = core.NewStandardTransaction(senderPubKey, receiverPubKeyBytes, amount, 0) // Stimulus might have zero fee
-		tx.TxType = core.StimulusTx // Explicitly set type if constructor doesn't
+		tx.TxType = core.StimulusTx                                                         // Explicitly set type if constructor doesn't
 	case core.TaxTx: // Tax txs also special
 		tx, err = core.NewStandardTransaction(senderPubKey, receiverPubKeyBytes, amount, 0) // Tax might have zero fee
-		tx.TxType = core.TaxTx // Explicitly set type
+		tx.TxType = core.TaxTx                                                              // Explicitly set type
 	default:
 		// Fallback for other types if NewTransaction doesn't have a specific constructor yet.
-		tx, err = core.NewStandardTransaction(senderPubKey, receiverPubKeyBytes, amount, 5) 
-		if err != nil { t.Fatalf("Failed to create generic transaction: %v", err) }
+		tx, err = core.NewStandardTransaction(senderPubKey, receiverPubKeyBytes, amount, 5)
+		if err != nil {
+			t.Fatalf("Failed to create generic transaction: %v", err)
+		}
 		tx.TxType = txType // Ensure type is set for generic case too.
 	}
 
@@ -133,7 +135,7 @@ func TestMempoolAddTransaction(t *testing.T) {
 	txInvalidSig := newTestSignedTransaction(t, 200, core.TxStandard)
 	originalSig := txInvalidSig.Signature
 	txInvalidSig.Signature = []byte("invalid_signature_bytes") // Tamper signature for test
-	
+
 	err = mp.AddTransaction(txInvalidSig)
 	if err == nil || !errors.Is(err, ErrInvalidTransaction) || !strings.Contains(err.Error(), "signature invalid") {
 		t.Errorf("Expected ErrInvalidTransaction for invalid signature, got %v", err)
@@ -150,7 +152,6 @@ func TestMempoolAddTransaction(t *testing.T) {
 	// Restore ID for future tests if needed
 	correctHash, _ := txHashMismatch.Hash()
 	txHashMismatch.ID = correctHash
-
 
 	// Test 6: Fill mempool to max capacity and try to add more
 	for i := 0; i < 9; i++ { // Already 1 tx in mempool (tx1)
@@ -234,7 +235,9 @@ func TestMempoolGetPendingTransactions(t *testing.T) {
 			t.Logf("Full Expected Order: %v", expectedOrderIDs)
 			t.Logf("Full Actual Order:   %v", func() []string {
 				ids := make([]string, len(pending))
-				for k, v := range pending { ids[k] = hex.EncodeToString(v.ID) }
+				for k, v := range pending {
+					ids[k] = hex.EncodeToString(v.ID)
+				}
 				return ids
 			}())
 			break
@@ -313,40 +316,40 @@ func TestMempoolRemoveTransactions(t *testing.T) {
 }
 
 func TestMempoolPruneByBlockchain(t *testing.T) {
-    mp, _ := NewMempool(10)
-    txInBlock1 := newTestSignedTransaction(t, 100, core.TxStandard)
-    txInBlock2 := newTestSignedTransaction(t, 101, core.StimulusTx)
-    txNotInBlock := newTestSignedTransaction(t, 200, core.TxStandard)
+	mp, _ := NewMempool(10)
+	txInBlock1 := newTestSignedTransaction(t, 100, core.TxStandard)
+	txInBlock2 := newTestSignedTransaction(t, 101, core.StimulusTx)
+	txNotInBlock := newTestSignedTransaction(t, 200, core.TxStandard)
 
-    mp.AddTransaction(txInBlock1)
-    mp.AddTransaction(txInBlock2)
-    mp.AddTransaction(txNotInBlock)
+	mp.AddTransaction(txInBlock1)
+	mp.AddTransaction(txInBlock2)
+	mp.AddTransaction(txNotInBlock)
 
-    if mp.Size() != 3 {
-        t.Fatalf("Mempool count before prune = %d; want 3", mp.Size())
-    }
+	if mp.Size() != 3 {
+		t.Fatalf("Mempool count before prune = %d; want 3", mp.Size())
+	}
 
-    // Create a dummy block that would contain txInBlock1 and txInBlock2
-    // Block struct now directly holds []Transaction
-    block := &core.Block{
-        Transactions: []*core.Transaction{txInBlock1, txInBlock2},
-        // Other fields like Height, PrevBlockHash, Hash, etc., are not strictly needed for PruneByBlockchain
-        // but would be present in a real block.
-    }
+	// Create a dummy block that would contain txInBlock1 and txInBlock2
+	// Block struct now directly holds []Transaction
+	block := &core.Block{
+		Transactions: []*core.Transaction{txInBlock1, txInBlock2},
+		// Other fields like Height, PrevBlockHash, Hash, etc., are not strictly needed for PruneByBlockchain
+		// but would be present in a real block.
+	}
 
-    mp.PruneByBlockchain([]*core.Block{block})
+	mp.PruneByBlockchain([]*core.Block{block})
 
-    if mp.Size() != 1 {
-        t.Errorf("Mempool count after prune = %d; want 1", mp.Size())
-    }
+	if mp.Size() != 1 {
+		t.Errorf("Mempool count after prune = %d; want 1", mp.Size())
+	}
 
-    if mp.Contains(txInBlock1.ID) {
-        t.Errorf("Transaction %s (in block) was not pruned", hex.EncodeToString(txInBlock1.ID))
-    }
-    if mp.Contains(txInBlock2.ID) {
-        t.Errorf("Transaction %s (in block) was not pruned", hex.EncodeToString(txInBlock2.ID))
-    }
-    if !mp.Contains(txNotInBlock.ID) {
-        t.Errorf("Transaction %s (not in block) was pruned but should have been kept", hex.EncodeToString(txNotInBlock.ID))
-    }
+	if mp.Contains(txInBlock1.ID) {
+		t.Errorf("Transaction %s (in block) was not pruned", hex.EncodeToString(txInBlock1.ID))
+	}
+	if mp.Contains(txInBlock2.ID) {
+		t.Errorf("Transaction %s (in block) was not pruned", hex.EncodeToString(txInBlock2.ID))
+	}
+	if !mp.Contains(txNotInBlock.ID) {
+		t.Errorf("Transaction %s (not in block) was pruned but should have been kept", hex.EncodeToString(txNotInBlock.ID))
+	}
 }

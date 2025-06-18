@@ -2,15 +2,31 @@ package consensus
 
 import (
 	"bytes" // Used for bytes.Equal for []byte comparison
+	"context"
 	"errors" // For custom errors
 	"fmt"    // For error messages
-	// "crypto/ed25519" // For actual public key types, in a future iteration
+	"log"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"empower1.com/core/core"
 )
 
 // Validator-specific errors
 var (
 	ErrInvalidValidatorAddress = errors.New("validator address cannot be empty")
 	ErrInvalidValidatorStake   = errors.New("validator stake must be positive")
+
+	ErrEngineAlreadyRunning = errors.New("consensus engine is already running")
+	ErrEngineNotRunning     = errors.New("consensus engine is not running")
+	ErrInvalidEngineConfig  = errors.New("invalid consensus engine configuration")
+	ErrFailedToGetLastBlock = errors.New("failed to get last block from blockchain")
+	ErrFailedToGetProposer  = errors.New("failed to get proposer for height")
+	ErrProposeBlockFailed   = errors.New("failed to propose block")
+	ErrIncomingBlockInvalid = errors.New("incoming block is invalid")
+	ErrFailedToAddBlock     = errors.New("failed to add block to blockchain")
 )
 
 // Validator represents a node that participates in the Proof-of-Stake consensus mechanism.
@@ -32,40 +48,40 @@ type Validator struct {
 // NewValidator creates a new Validator instance.
 // This constructor ensures basic validity, adhering to "Know Your Core, Keep it Clear".
 func NewValidator(address []byte, stake uint64) (*Validator, error) {
-    if len(address) == 0 {
-        return nil, ErrInvalidValidatorAddress
-    }
-    // In a real blockchain, you'd validate address format (e.g., checksum, length).
-    
-    if stake == 0 { // Stake must be positive to participate in PoS
-        return nil, ErrInvalidValidatorStake
-    }
+	if len(address) == 0 {
+		return nil, ErrInvalidValidatorAddress
+	}
+	// In a real blockchain, you'd validate address format (e.g., checksum, length).
 
-    return &Validator{
-        Address:  address,
-        Stake:    stake,
-        IsActive: true, // Assume active by default on creation, can be changed later
-    }, nil
+	if stake == 0 { // Stake must be positive to participate in PoS
+		return nil, ErrInvalidValidatorStake
+	}
+
+	return &Validator{
+		Address:  address,
+		Stake:    stake,
+		IsActive: true, // Assume active by default on creation, can be changed later
+	}, nil
 }
 
 // Equals checks if two Validator instances represent the same entity, based on their Address.
 // This is critical for managing validator sets and preventing duplicates.
 func (v *Validator) Equals(other *Validator) bool {
-    if v == nil || other == nil { // A validator cannot be nil for comparison
-        return false
-    }
-    // Use bytes.Equal for byte slice comparison, which is correct for addresses.
-    return bytes.Equal(v.Address, other.Address)
+	if v == nil || other == nil { // A validator cannot be nil for comparison
+		return false
+	}
+	// Use bytes.Equal for byte slice comparison, which is correct for addresses.
+	return bytes.Equal(v.Address, other.Address)
 }
 
 // String provides a human-readable string representation of the Validator.
 // Useful for logging and debugging, aligning with "Sense the Landscape".
 func (v *Validator) String() string {
-    status := "Active"
-    if !v.IsActive {
-        status = "Inactive"
-    }
-    return fmt.Sprintf("Validator{Address: %x, Stake: %d, Status: %s}", v.Address, v.Stake, status)
+	status := "Active"
+	if !v.IsActive {
+		status = "Inactive"
+	}
+	return fmt.Sprintf("Validator{Address: %x, Stake: %d, Status: %s}", v.Address, v.Stake, status)
 }
 
 // --- Conceptual V2+ Methods for EmPower1's Enhanced PoS ---
@@ -90,7 +106,7 @@ func (v *Validator) UpdateActivityScore(activityDelta float64) {
 func (v *Validator) TotalWeight() uint64 {
     // Example: (Stake + (Stake * ReputationScore * ActivityScore)) or other complex formula
     // This is the core algorithm for weighted proposer selection/voting.
-    weight := v.Stake 
+    weight := v.Stake
     // if v.ReputationScore > 0 && v.ActivityScore > 0 {
     //    weight += uint64(float64(v.Stake) * v.ReputationScore * v.ActivityScore)
     // }
@@ -105,3 +121,170 @@ func (v *Validator) IsEligible(currentHeight int64) bool {
     return v.IsActive // Basic for now
 }
 */
+
+// SimulatedNetwork interface defines methods for network communication in the consensus engine.
+type SimulatedNetwork interface {
+	BroadcastBlock(block *core.Block) error
+	ReceiveBlocks() <-chan *core.Block
+}
+
+// ConsensusEngine manages the consensus process, including proposing and validating blocks.
+type ConsensusEngine struct {
+	validatorAddress  string
+	isValidator       bool
+	proposerService   *ProposerService
+	validationService *ValidationService
+	consensusState    *ConsensusState
+	blockchain        *core.Blockchain
+	network           SimulatedNetwork
+
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	logger    *log.Logger
+	isRunning atomic.Bool
+	startOnce sync.Once
+	stopOnce  sync.Once
+}
+
+// NewConsensusEngine creates a new instance of ConsensusEngine with the necessary dependencies.
+func NewConsensusEngine(
+	validatorAddress string,
+	proposerService *ProposerService,
+	validationService *ValidationService,
+	consensusState *ConsensusState,
+	blockchain *core.Blockchain,
+	network SimulatedNetwork,
+) (*ConsensusEngine, error) {
+	if proposerService == nil || validationService == nil || consensusState == nil || blockchain == nil || network == nil {
+		return nil, fmt.Errorf("%w: all core services must be provided", ErrInvalidEngineConfig)
+	}
+	isValidator := (proposerService != nil && proposerService.validatorAddress == validatorAddress)
+	logger := log.New(os.Stdout, "CONSENSUS_ENGINE: ", log.Ldate|log.Ltime|log.Lshortfile)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	engine := &ConsensusEngine{
+		validatorAddress:  validatorAddress,
+		isValidator:       isValidator,
+		proposerService:   proposerService,
+		validationService: validationService,
+		consensusState:    consensusState,
+		blockchain:        blockchain,
+		network:           network,
+		logger:            logger,
+		ctx:               ctx,
+		cancel:            cancel,
+	}
+	engine.logger.Println("ConsensusEngine initialized.")
+	return engine, nil
+}
+
+// Start begins the consensus engine's operation, enabling block proposal and validation.
+func (ce *ConsensusEngine) Start() error {
+	var err error
+	ce.startOnce.Do(func() {
+		if ce.isRunning.Load() {
+			err = ErrEngineAlreadyRunning
+			return
+		}
+		ce.isRunning.Store(true)
+		ce.wg.Add(2)
+		go ce.startEngineLoop()
+		go ce.processIncomingBlocks()
+		ce.logger.Println("ConsensusEngine started.")
+	})
+	return err
+}
+
+// Stop halts the consensus engine, disabling block proposal and validation.
+func (ce *ConsensusEngine) Stop() error {
+	var err error
+	ce.stopOnce.Do(func() {
+		if !ce.isRunning.Load() {
+			err = ErrEngineNotRunning
+			return
+		}
+		ce.cancel()
+		ce.wg.Wait()
+		ce.isRunning.Store(false)
+		ce.logger.Println("ConsensusEngine stopped.")
+	})
+	return err
+}
+
+func (ce *ConsensusEngine) startEngineLoop() {
+	defer ce.wg.Done()
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	ce.logger.Println("Engine loop started.")
+
+	for {
+		select {
+		case <-ce.ctx.Done():
+			ce.logger.Println("Engine loop received stop signal.")
+			return
+		case <-ticker.C:
+			currentChainHeight := ce.blockchain.ChainHeight()
+			if currentChainHeight == -1 {
+				ce.logger.Println("Blockchain is empty, waiting for genesis block to sync or be created.")
+				continue
+			}
+			nextBlockHeight := currentChainHeight + 1
+			expectedProposer, err := ce.consensusState.GetProposerForHeight(nextBlockHeight)
+			if err != nil {
+				ce.logger.Printf("Failed to get proposer for height %d: %v", nextBlockHeight, err)
+				continue
+			}
+			if ce.isValidator && bytes.Equal([]byte(ce.validatorAddress), expectedProposer.Address) {
+				ce.logger.Printf("It's OUR turn to propose block #%d!", nextBlockHeight)
+				if err := ce.proposeBlock(nextBlockHeight); err != nil {
+					ce.logger.Printf("Failed to propose block #%d: %v", nextBlockHeight, err)
+				}
+			}
+		}
+	}
+}
+
+func (ce *ConsensusEngine) proposeBlock(height int64) error {
+	lastBlock, err := ce.blockchain.GetLastBlock()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrFailedToGetLastBlock, err)
+	}
+	proposal, err := ce.proposerService.CreateProposalBlock(height, lastBlock.Hash, lastBlock.Timestamp)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrProposeBlockFailed, err)
+	}
+	if err := ce.network.BroadcastBlock(proposal); err != nil {
+		return fmt.Errorf("failed to broadcast proposed block %d: %w", height, err)
+	}
+	ce.logger.Printf("Proposed and broadcasted block #%d (%x).", proposal.Height, proposal.Hash)
+	return nil
+}
+
+func (ce *ConsensusEngine) processIncomingBlocks() {
+	defer ce.wg.Done()
+	ce.logger.Println("Incoming block processor started.")
+
+	for {
+		select {
+		case <-ce.ctx.Done():
+			ce.logger.Println("Incoming block processor received stop signal.")
+			return
+		case incomingBlock := <-ce.network.ReceiveBlocks():
+			ce.logger.Printf("Received block #%d (%x) from network. Proposer: %x",
+				incomingBlock.Height, incomingBlock.Hash, incomingBlock.ProposerAddress)
+			if err := ce.validationService.ValidateBlock(incomingBlock); err != nil {
+				ce.logger.Printf("Incoming block #%d (%x) is INVALID: %v", incomingBlock.Height, incomingBlock.Hash, err)
+				continue
+			}
+			if err := ce.blockchain.AddBlock(incomingBlock); err != nil {
+				ce.logger.Printf("Failed to add validated block #%d (%x) to blockchain: %v", incomingBlock.Height, incomingBlock.Hash, err)
+				continue
+			}
+			if err := ce.consensusState.UpdateHeight(incomingBlock.Height); err != nil {
+				ce.logger.Printf("Failed to update consensus state height after adding block %d: %v", incomingBlock.Height, err)
+			}
+		}
+	}
+}

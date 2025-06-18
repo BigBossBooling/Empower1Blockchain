@@ -1,300 +1,197 @@
-package network
+package consensus
 
 import (
 	"bytes"
-	"errors" // Explicitly import errors
+	"context"
+	"errors"
 	"fmt"
-	"log"    // For structured logging
-	"os"     // For log output
+	"log"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"empower1.com/core/core" // Assuming 'core' is the package alias for empower1.com/core/core
+	"empower1.com/core/core"
 )
 
-// Define custom errors for the Network package.
+// Define custom errors for the Consensus package.
 var (
-	ErrNetworkAlreadyRunning = errors.New("network is already running")
-	ErrNetworkNotRunning     = errors.New("network is not running")
-	ErrBroadcastFailed       = errors.New("failed to broadcast message")
-	ErrInvalidPeer           = errors.New("invalid peer")
+	ErrEngineAlreadyRunning = errors.New("consensus engine is already running")
+	ErrEngineNotRunning     = errors.New("consensus engine is not running")
+	ErrInvalidEngineConfig  = errors.New("invalid consensus engine configuration")
+	ErrFailedToGetLastBlock = errors.New("failed to get last block from blockchain")
+	ErrFailedToGetProposer  = errors.New("failed to get proposer for height")
+	ErrProposeBlockFailed   = errors.New("failed to propose block")
+	ErrIncomingBlockInvalid = errors.New("incoming block is invalid")
+	ErrFailedToAddBlock     = errors.New("failed to add block to blockchain")
 )
 
-// Peer represents a conceptual peer in the network.
-// In a real P2P network, this would include connection details (IP, port, ID).
-type Peer struct {
-	ID      []byte // Cryptographic ID (e.g., public key hash)
-	Address string // Conceptual network address (e.g., "127.0.0.1:8080")
-	// For simulation, we'll use an internal channel for direct communication.
-	incomingMsgs chan interface{} // Channel for direct simulation of messages to this peer
+// SimulatedNetwork defines an interface for conceptual network interactions.
+type SimulatedNetwork interface {
+	BroadcastBlock(block *core.Block) error
+	ReceiveBlocks() <-chan *core.Block
 }
 
-// Network manages the peer-to-peer communication.
-// For V1, this is a simulated in-memory network.
-type Network struct {
-	mu           sync.RWMutex      // Mutex for concurrent access to peer map
-	peers        map[string]*Peer  // Map of connected peers by hex ID
-	isRunning    bool              // Flag to track network status
-	stopChan     chan struct{}     // Channel to signal network shutdown
-	wg           sync.WaitGroup    // WaitGroup for goroutines
-	logger       *log.Logger       // Dedicated logger for the Network instance
+// ConsensusEngine orchestrates the PoS consensus process.
+type ConsensusEngine struct {
+	validatorAddress  string
+	isValidator       bool
+	proposerService   *ProposerService
+	validationService *ValidationService
+	consensusState    *ConsensusState
+	blockchain        *core.Blockchain
+	network           SimulatedNetwork
 
-	// Channels for other services to receive blocks/transactions from the network
-	blockChan    chan *core.Block
-	txChan       chan *core.Transaction
-
-	// This node's own ID for broadcasting
-	selfID       []byte
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	logger    *log.Logger
+	isRunning atomic.Bool
+	startOnce sync.Once
+	stopOnce  sync.Once
 }
 
-// NewNetwork creates a new simulated P2P Network instance.
-// It sets up internal channels and prepares for peer management.
-// selfID is the ID of the node using this network instance (e.g., the local blockchain node).
-func NewNetwork(selfID []byte, blockBufferSize, txBufferSize int) (*Network, error) {
-	if len(selfID) == 0 {
-		return nil, fmt.Errorf("%w: self ID cannot be empty", ErrNetworkAlreadyRunning) // Reusing error
+// NewConsensusEngine creates a new ConsensusEngine instance.
+func NewConsensusEngine(
+	validatorAddress string,
+	proposerService *ProposerService,
+	validationService *ValidationService,
+	consensusState *ConsensusState,
+	blockchain *core.Blockchain,
+	network SimulatedNetwork,
+) (*ConsensusEngine, error) {
+	if proposerService == nil || validationService == nil || consensusState == nil || blockchain == nil || network == nil {
+		return nil, fmt.Errorf("%w: all core services must be provided", ErrInvalidEngineConfig)
 	}
-	if blockBufferSize <= 0 || txBufferSize <= 0 {
-		return nil, fmt.Errorf("buffer sizes must be positive")
-	}
+	isValidator := (proposerService != nil && proposerService.validatorAddress == validatorAddress)
+	logger := log.New(os.Stdout, "CONSENSUS_ENGINE: ", log.Ldate|log.Ltime|log.Lshortfile)
+	ctx, cancel := context.WithCancel(context.Background())
 
-	logger := log.New(os.Stdout, "NETWORK: ", log.Ldate|log.Ltime|log.Lshortfile)
-	
-	net := &Network{
-		peers:        make(map[string]*Peer),
-		isRunning:    false,
-		stopChan:     make(chan struct{}),
-		wg:           sync.WaitGroup{},
-		logger:       logger,
-		blockChan:    make(chan *core.Block, blockBufferSize),
-		txChan:       make(chan *core.Transaction, txBufferSize),
-		selfID:       selfID,
+	engine := &ConsensusEngine{
+		validatorAddress:  validatorAddress,
+		isValidator:       isValidator,
+		proposerService:   proposerService,
+		validationService: validationService,
+		consensusState:    consensusState,
+		blockchain:        blockchain,
+		network:           network,
+		logger:            logger,
+		ctx:               ctx,
+		cancel:            cancel,
 	}
-	net.logger.Println("Network initialized for node:", hex.EncodeToString(selfID))
-	return net, nil
+	engine.logger.Println("ConsensusEngine initialized.")
+	return engine, nil
 }
 
-// Start initiates the network's operation.
-// It starts internal goroutines for processing messages.
-func (net *Network) Start() error {
-	net.mu.Lock()
-	defer net.mu.Unlock()
-
-	if net.isRunning {
-		return ErrNetworkAlreadyRunning
-	}
-	net.isRunning = true
-
-	// In a real network, this would start the listening server for incoming connections
-	// and goroutines for maintaining connections to peers.
-	// For simulation, we will conceptually "process" internal peer message channels.
-
-	net.logger.Println("Network started.")
-	return nil
-}
-
-// Stop gracefully shuts down the network.
-func (net *Network) Stop() error {
-	net.mu.Lock()
-	defer net.mu.Unlock()
-
-	if !net.isRunning {
-		return ErrNetworkNotRunning
-	}
-	net.isRunning = false
-
-	close(net.stopChan)     // Signal all internal goroutines to stop
-	net.wg.Wait()           // Wait for all goroutines to finish
-
-	// Close outgoing channels (if any) and incoming public channels
-	close(net.blockChan)
-	close(net.txChan)
-
-	net.logger.Println("Network stopped.")
-	return nil
-}
-
-// ConnectPeer conceptually adds a new peer to the network.
-// In a real network, this would establish a persistent connection.
-func (net *Network) ConnectPeer(peerID []byte, peerAddress string) (*Peer, error) {
-	net.mu.Lock()
-	defer net.mu.Unlock()
-
-	if len(peerID) == 0 {
-		return nil, ErrInvalidPeer
-	}
-	peerIDHex := hex.EncodeToString(peerID)
-
-	if _, exists := net.peers[peerIDHex]; exists {
-		net.logger.Debugf("NETWORK: Peer %s already connected.", peerIDHex)
-		return net.peers[peerIDHex], nil
-	}
-	
-	// Create a new conceptual peer with an incoming message channel for simulation
-	newPeer := &Peer{
-		ID:           peerID,
-		Address:      peerAddress,
-		incomingMsgs: make(chan interface{}, 100), // Buffered channel for simulation
-	}
-	net.peers[peerIDHex] = newPeer
-	net.logger.Printf("NETWORK: Connected to new peer: %s", peerAddress)
-	return newPeer, nil
-}
-
-// DisconnectPeer conceptually removes a peer from the network.
-func (net *Network) DisconnectPeer(peerID []byte) error {
-	net.mu.Lock()
-	defer net.mu.Unlock()
-
-	peerIDHex := hex.EncodeToString(peerID)
-	if peer, exists := net.peers[peerIDHex]; exists {
-		delete(net.peers, peerIDHex)
-		close(peer.incomingMsgs) // Close the peer's channel
-		net.logger.Printf("NETWORK: Disconnected from peer: %s", peer.Address)
-		return nil
-	}
-	return fmt.Errorf("peer %s not found", peerIDHex)
-}
-
-
-// BroadcastBlock simulates broadcasting a block to all connected peers.
-// For simulation, it sends the block to each peer's conceptual incoming message channel.
-// This implements the `SimulatedNetwork` interface.
-func (net *Network) BroadcastBlock(block *core.Block) error {
-	net.mu.RLock() // Acquire read lock for iterating peers
-	defer net.mu.RUnlock()
-
-	if !net.isRunning {
-		return ErrNetworkNotRunning
-	}
-	if block == nil {
-		return fmt.Errorf("%w: cannot broadcast nil block", ErrBroadcastFailed)
-	}
-
-	blockHashHex := hex.EncodeToString(block.Hash)
-	net.logger.Printf("NETWORK: Broadcasting block #%d (%s) to %d peers.", block.Height, blockHashHex, len(net.peers))
-
-	// Simulate sending to each peer. In a real system, this would be over actual network connections.
-	// Use a goroutine to avoid blocking if a peer's channel is full.
-	for _, peer := range net.peers {
-		if bytes.Equal(peer.ID, net.selfID) { // Don't send to self
-			continue
+// Start initiates the consensus engine's operation.
+func (ce *ConsensusEngine) Start() error {
+	var err error
+	ce.startOnce.Do(func() {
+		if ce.isRunning.Load() {
+			err = ErrEngineAlreadyRunning
+			return
 		}
-		// Try to send without blocking. If channel is full, log a warning (conceptual congestion).
-		select {
-		case peer.incomingMsgs <- block:
-			net.logger.Debugf("NETWORK: Sent block %s to peer %s", blockHashHex, hex.EncodeToString(peer.ID))
-		default:
-			net.logger.Warnf("NETWORK_WARN: Peer %s's channel full, failed to send block %s.", hex.EncodeToString(peer.ID), blockHashHex)
+		ce.isRunning.Store(true)
+		ce.wg.Add(2)
+		go ce.startEngineLoop()
+		go ce.processIncomingBlocks()
+		ce.logger.Println("ConsensusEngine started.")
+	})
+	return err
+}
+
+// Stop gracefully shuts down the consensus engine.
+func (ce *ConsensusEngine) Stop() error {
+	var err error
+	ce.stopOnce.Do(func() {
+		if !ce.isRunning.Load() {
+			err = ErrEngineNotRunning
+			return
 		}
-	}
-	return nil
+		ce.cancel()
+		ce.wg.Wait()
+		ce.isRunning.Store(false)
+		ce.logger.Println("ConsensusEngine stopped.")
+	})
+	return err
 }
 
-// BroadcastTransaction simulates broadcasting a transaction to all connected peers.
-func (net *Network) BroadcastTransaction(tx *core.Transaction) error {
-	net.mu.RLock()
-	defer net.mu.RUnlock()
+// startEngineLoop is the main loop for the consensus engine.
+func (ce *ConsensusEngine) startEngineLoop() {
+	defer ce.wg.Done()
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-	if !net.isRunning {
-		return ErrNetworkNotRunning
-	}
-	if tx == nil {
-		return fmt.Errorf("%w: cannot broadcast nil transaction", ErrBroadcastFailed)
-	}
-
-	txIDHex := hex.EncodeToString(tx.ID)
-	net.logger.Printf("NETWORK: Broadcasting transaction %s to %d peers.", txIDHex, len(net.peers))
-
-	for _, peer := range net.peers {
-		if bytes.Equal(peer.ID, net.selfID) { // Don't send to self
-			continue
-		}
-		select {
-		case peer.incomingMsgs <- tx:
-			net.logger.Debugf("NETWORK: Sent transaction %s to peer %s", txIDHex, hex.EncodeToString(peer.ID))
-		default:
-			net.logger.Warnf("NETWORK_WARN: Peer %s's channel full, failed to send transaction %s.", hex.EncodeToString(peer.ID), txIDHex)
-		}
-	}
-	return nil
-}
-
-// ReceiveBlocks returns a channel for receiving incoming blocks.
-// This is the public interface for the ConsensusEngine or Blockchain service to consume blocks.
-func (net *Network) ReceiveBlocks() <-chan *core.Block {
-	return net.blockChan
-}
-
-// ReceiveTransactions returns a channel for receiving incoming transactions.
-// This is the public interface for the Mempool service to consume transactions.
-func (net *Network) ReceiveTransactions() <-chan *core.Transaction {
-	return net.txChan
-}
-
-// conceptualPeerMessageProcessor simulates processing messages received by a peer.
-// In a real network, this would be the inbound message handler for each connection.
-// For simulation, it reads from peer.incomingMsgs and routes to the appropriate public channel.
-func (net *Network) conceptualPeerMessageProcessor(p *Peer) {
-	defer net.wg.Done()
-	net.logger.Printf("NETWORK: Peer message processor started for %s", hex.EncodeToString(p.ID))
+	ce.logger.Println("Engine loop started.")
 
 	for {
 		select {
-		case <-net.stopChan:
-			net.logger.Debugf("NETWORK: Peer message processor for %s received stop signal.", hex.EncodeToString(p.ID))
+		case <-ce.ctx.Done():
+			ce.logger.Println("Engine loop received stop signal.")
 			return
-		case msg, ok := <-p.incomingMsgs:
-			if !ok { // Channel closed
-				net.logger.Debugf("NETWORK: Peer %s incoming channel closed.", hex.EncodeToString(p.ID))
-				return
+		case <-ticker.C:
+			currentChainHeight := ce.blockchain.ChainHeight()
+			if currentChainHeight == -1 {
+				ce.logger.Println("Blockchain is empty, waiting for genesis block to sync or be created.")
+				continue
 			}
-			switch v := msg.(type) {
-			case *core.Block:
-				// Try to send block to blockChan. If full, it means the downstream service is slow.
-				select {
-				case net.blockChan <- v:
-					net.logger.Debugf("NETWORK: Received and routed block %x from %s", v.Hash, hex.EncodeToString(p.ID))
-				default:
-					net.logger.Warnf("NETWORK_WARN: Block channel full, dropping block %x from %s.", v.Hash, hex.EncodeToString(p.ID))
+			nextBlockHeight := currentChainHeight + 1
+			expectedProposer, err := ce.consensusState.GetProposerForHeight(nextBlockHeight)
+			if err != nil {
+				ce.logger.Printf("Failed to get proposer for height %d: %v", nextBlockHeight, err)
+				continue
+			}
+			if ce.isValidator && bytes.Equal([]byte(ce.validatorAddress), expectedProposer.Address) {
+				ce.logger.Printf("It's OUR turn to propose block #%d!", nextBlockHeight)
+				if err := ce.proposeBlock(nextBlockHeight); err != nil {
+					ce.logger.Printf("Failed to propose block #%d: %v", nextBlockHeight, err)
 				}
-			case *core.Transaction:
-				// Try to send transaction to txChan.
-				select {
-				case net.txChan <- v:
-					net.logger.Debugf("NETWORK: Received and routed tx %x from %s", v.ID, hex.EncodeToString(p.ID))
-				default:
-					net.logger.Warnf("NETWORK_WARN: Tx channel full, dropping tx %x from %s.", v.ID, hex.EncodeToString(p.ID))
-				}
-			default:
-				net.logger.Warnf("NETWORK_WARN: Received unknown message type from %s.", hex.EncodeToString(p.ID))
 			}
 		}
 	}
 }
 
-// SimulatePeerDiscovery conceptually adds a list of initial peers to the network.
-// This would be replaced by actual peer discovery mechanisms (e.g., DNS seeds, Kademlia DHT).
-func (net *Network) SimulatePeerDiscovery(peerIDs [][]byte, peerAddresses []string) {
-    net.mu.Lock()
-    defer net.mu.Unlock()
+// proposeBlock orchestrates the creation, signing, and broadcasting of a new block.
+func (ce *ConsensusEngine) proposeBlock(height int64) error {
+	lastBlock, err := ce.blockchain.GetLastBlock()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrFailedToGetLastBlock, err)
+	}
+	proposal, err := ce.proposerService.CreateProposalBlock(height, lastBlock.Hash, lastBlock.Timestamp)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrProposeBlockFailed, err)
+	}
+	if err := ce.network.BroadcastBlock(proposal); err != nil {
+		return fmt.Errorf("failed to broadcast proposed block %d: %w", height, err)
+	}
+	ce.logger.Printf("Proposed and broadcasted block #%d (%x).", proposal.Height, proposal.Hash)
+	return nil
+}
 
-    for i, id := range peerIDs {
-        if bytes.Equal(id, net.selfID) { // Don't connect to self
-            continue
-        }
-        addr := peerAddresses[i]
-        // ConnectPeer handles adding, but here we just need to create the peer and its channel
-        if _, exists := net.peers[hex.EncodeToString(id)]; !exists {
-            newPeer := &Peer{
-                ID:           id,
-                Address:      addr,
-                incomingMsgs: make(chan interface{}, 100), // Buffered channel
-            }
-            net.peers[hex.EncodeToString(id)] = newPeer
-            net.wg.Add(1) // Add for this new conceptual peer processor
-            go net.conceptualPeerMessageProcessor(newPeer)
-            net.logger.Printf("NETWORK: Discovered and simulated connection to peer: %s (%s)", hex.EncodeToString(id), addr)
-        }
-    }
+// processIncomingBlocks listens for blocks received from the network and validates/adds them.
+func (ce *ConsensusEngine) processIncomingBlocks() {
+	defer ce.wg.Done()
+	ce.logger.Println("Incoming block processor started.")
+
+	for {
+		select {
+		case <-ce.ctx.Done():
+			ce.logger.Println("Incoming block processor received stop signal.")
+			return
+		case incomingBlock := <-ce.network.ReceiveBlocks():
+			ce.logger.Printf("Received block #%d (%x) from network. Proposer: %x",
+				incomingBlock.Height, incomingBlock.Hash, incomingBlock.ProposerAddress)
+			if err := ce.validationService.ValidateBlock(incomingBlock); err != nil {
+				ce.logger.Printf("Incoming block #%d (%x) is INVALID: %v", incomingBlock.Height, incomingBlock.Hash, err)
+				continue
+			}
+			if err := ce.blockchain.AddBlock(incomingBlock); err != nil {
+				ce.logger.Printf("Failed to add validated block #%d (%x) to blockchain: %v", incomingBlock.Height, incomingBlock.Hash, err)
+				continue
+			}
+			if err := ce.consensusState.UpdateHeight(incomingBlock.Height); err != nil {
+				ce.logger.Printf("Failed to update consensus state height after adding block %d: %v", incomingBlock.Height, err)
+			}
+		}
+	}
 }

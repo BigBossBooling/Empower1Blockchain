@@ -1,278 +1,210 @@
-package core
+package consensus
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/binary"
-	"errors"
-	"fmt"
-	"time"
+    "bytes"
+    "context"
+    "errors"
+    "fmt"
+    "log"
+    "os"
+    "sync"
+    "sync/atomic"
+    "time"
 
-	// Placeholder for actual crypto library, e.g., Ed25519
-	// "crypto/ed25519"
-	// "encoding/hex"
-	// "math/big" // Potentially for handling large amounts in redistribution logic
-	// "log" // For proper logging instead of fmt.Printf
+    "empower1.com/core/core"
 )
 
-// Define custom errors for clearer error handling, critical for financial integrity.
+// --- Custom Errors for ConsensusEngine ---
 var (
-	ErrBlockValidationFailed    = errors.New("block validation failed")
-	ErrInvalidSignature         = errors.New("invalid block signature")
-	ErrMissingProposer          = errors.New("block has no proposer address")
-	ErrMissingSignature         = errors.New("block has no signature")
-	ErrInvalidAddressFormat     = errors.New("invalid proposer address format")
-	ErrKeyUnmarshal             = errors.New("could not unmarshal public/private key")
-	ErrTransactionVerification  = errors.New("transaction verification failed") // Added for tx integrity
-	ErrAILogicFailure           = errors.New("AI/ML logic encountered an unrecoverable error") // Specific to EmPower1
+    ErrEngineAlreadyRunning  = errors.New("consensus engine is already running")
+    ErrEngineNotRunning      = errors.New("consensus engine is not running")
+    ErrInvalidEngineConfig   = errors.New("invalid consensus engine configuration")
+    ErrFailedToGetLastBlock  = errors.New("failed to retrieve last block from blockchain")
+    ErrFailedToGetProposer   = errors.New("failed to determine proposer for height")
+    ErrProposeBlockFailed    = errors.New("block proposal creation or signing failed")
+    ErrIncomingBlockInvalid  = errors.New("incoming block failed validation")
+    ErrFailedToAddBlock      = errors.New("failed to add validated block to blockchain")
+    ErrConsensusStateUpdate  = errors.New("failed to update consensus state height")
+    ErrBroadcastFailed       = errors.New("failed to broadcast block")
 )
 
-// Transaction represents a basic unit of value transfer.
-// EmPower1: Transactions will have specific types for redistribution.
-type Transaction struct {
-	ID        []byte // Unique ID for the transaction (e.g., hash of its content)
-	Timestamp int64
-	Inputs    []TxInput  // List of transaction inputs (references to previous unspent outputs)
-	Outputs   []TxOutput // List of transaction outputs
-	// EmPower1 Specific:
-	TxType    TxType // Type of transaction: Standard, Stimulus, Tax
-	Metadata  map[string]string // Optional metadata, e.g., for AI/ML logging
+// SimulatedNetwork defines the interface for conceptual network interactions.
+type SimulatedNetwork interface {
+    BroadcastBlock(block *core.Block) error
+    ReceiveBlocks() <-chan *core.Block
 }
 
-// TxType defines the nature of the transaction for EmPower1's economic model.
-type TxType int
+// ConsensusEngine orchestrates the PoS consensus process for EmPower1 Blockchain.
+type ConsensusEngine struct {
+    validatorAddress  []byte
+    isValidator       bool
+    proposerService   *ProposerService
+    validationService *ValidationService
+    consensusState    *ConsensusState
+    blockchain        *core.Blockchain
+    network           SimulatedNetwork
 
-const (
-	StandardTx TxType = iota // Regular user-to-user transfer
-	StimulusTx             // AI/ML-triggered redistribution payment
-	TaxTx                  // AI/ML-triggered tax collection on high-value transactions
-)
-
-
-// TxInput represents a transaction input.
-type TxInput struct {
-	TxID      []byte // Reference to the ID of the transaction whose output is being spent
-	Vout      int    // Index of the output in that transaction
-	Signature []byte // Cryptographic signature of the input by the owner
-	PubKey    []byte // Public key of the owner (used to verify signature and address)
+    ctx       context.Context
+    cancel    context.CancelFunc
+    wg        sync.WaitGroup
+    logger    *log.Logger
+    isRunning atomic.Bool
+    startOnce sync.Once
+    stopOnce  sync.Once
 }
 
-// TxOutput represents a transaction output.
-type TxOutput struct {
-	Value   int64  // Amount of cryptocurrency
-	PubKeyHash []byte // Hash of the recipient's public key (address)
-}
-
-
-// Block represents a block in the EmPower1 Blockchain.
-// Enhanced documentation for clarity and EmPower1's purpose, adhering to "Know Your Core, Keep it Clear".
-type Block struct {
-	Height          int64         // Block height (index in the chain)
-	Timestamp       int64         // Unix nanoseconds timestamp of block creation
-	PrevBlockHash   []byte        // Hash of the previous block
-	Transactions    []Transaction // List of transactions included in this block
-	ProposerAddress []byte        // Public key or identifier of the validator who proposed this block
-	Signature       []byte        // Cryptographic signature of the block header by the proposer
-	Hash            []byte        // The cryptographic hash of this block (calculated from header + proposer + signature)
-	// EmPower1 Specific:
-	AIAuditLog      []byte        // Hash of an AI/ML audit log related to this block's redistribution (conceptual)
-}
-
-// NewBlock creates a new block without the final Hash, ProposerAddress, or Signature.
-// Transactions are included at creation.
-// These finalization fields are populated by the consensus mechanism.
-func NewBlock(height int64, prevBlockHash []byte, transactions []Transaction) *Block {
-	block := &Block{
-		Height:        height,
-		Timestamp:     time.Now().UnixNano(),
-		PrevBlockHash: prevBlockHash,
-		Transactions:  transactions, // Transactions are part of the block's core data
-	}
-	return block
-}
-
-// HeaderForSigning returns the byte representation of the block's content that gets signed.
-// This is critical for cryptographic integrity. It explicitly EXCLUDES the final Hash and Signature.
-// This structure must be robust and deterministic for a financial blockchain.
-func (b *Block) HeaderForSigning() []byte {
-    var buf bytes.Buffer
-    binary.Write(&buf, binary.BigEndian, b.Height)
-    binary.Write(&buf, binary.BigEndian, b.Timestamp)
-    buf.Write(b.PrevBlockHash)
-    buf.Write(b.ProposerAddress) // ProposerAddress needs to be set *before* calling this for self-signing
-
-    // Hash all transaction IDs for a concise, ordered representation
-    txIDs := b.HashTransactions() // Assuming a method to hash/summarize transactions
-    buf.Write(txIDs)
-	
-	// EmPower1 Specific: Include AI Audit Log in what's signed for transparency
-	buf.Write(b.AIAuditLog) 
-
-    return buf.Bytes()
-}
-
-// HashTransactions creates a single hash from all transaction IDs in the block.
-// This is crucial for verifying the integrity of the transaction set within the block.
-func (b *Block) HashTransactions() []byte {
-    var txHashes [][]byte
-    for _, tx := range b.Transactions {
-        txHashes = append(txHashes, tx.ID) // Assuming Transaction.ID is its hash
+// NewConsensusEngine creates a new ConsensusEngine instance.
+func NewConsensusEngine(
+    validatorAddress []byte,
+    proposerService *ProposerService,
+    validationService *ValidationService,
+    consensusState *ConsensusState,
+    blockchain *core.Blockchain,
+    network SimulatedNetwork,
+) (*ConsensusEngine, error) {
+    if proposerService == nil || validationService == nil || consensusState == nil || blockchain == nil || network == nil {
+        return nil, fmt.Errorf("%w: all core services (proposer, validator, state, blockchain, network) must be provided", ErrInvalidEngineConfig)
     }
-    // Merkle Root calculation would go here for production blockchain
-    // For simplicity, just join and hash the IDs for V1
-    hasher := sha256.New()
-    hasher.Write(bytes.Join(txHashes, []byte{}))
-    return hasher.Sum(nil)
+    if len(validatorAddress) == 0 {
+        return nil, fmt.Errorf("%w: validator address for this node cannot be empty", ErrInvalidEngineConfig)
+    }
+    isValidator := bytes.Equal(proposerService.validatorAddress, validatorAddress)
+    logger := log.New(os.Stdout, "CONSENSUS_ENGINE: ", log.Ldate|log.Ltime|log.Lshortfile)
+    ctx, cancel := context.WithCancel(context.Background())
+
+    engine := &ConsensusEngine{
+        validatorAddress:  validatorAddress,
+        isValidator:       isValidator,
+        proposerService:   proposerService,
+        validationService: validationService,
+        consensusState:    consensusState,
+        blockchain:        blockchain,
+        network:           network,
+        logger:            logger,
+        ctx:               ctx,
+        cancel:            cancel,
+    }
+    engine.logger.Println("ConsensusEngine initialized.")
+    return engine, nil
 }
 
-
-// SetHash calculates and sets the final cryptographic hash of the block.
-// This hash should ideally cover all immutable components of the block, including its signature.
-func (b *Block) SetHash() {
-    blockHeaders := b.HeaderForSigning() 
-    hash := sha256.Sum256(blockHeaders)
-    b.Hash = hash[:]
-}
-
-// Sign generates a cryptographic signature for the block's header using a private key.
-// It sets the ProposerAddress and the generated Signature.
-// This is a placeholder that requires integration with a real cryptographic library.
-func (b *Block) Sign(proposerAddressBytes []byte, privateKeyBytes []byte) error {
-	if len(proposerAddressBytes) == 0 {
-		return ErrMissingProposer
-	}
-	if len(privateKeyBytes) == 0 {
-		return fmt.Errorf("private key cannot be empty") 
-	}
-
-	b.ProposerAddress = proposerAddressBytes
-
-	// In a real implementation:
-	// privKey := ed25519.PrivateKey(privateKeyBytes)
-	// sig := ed25519.Sign(privKey, b.HeaderForSigning())
-	// b.Signature = sig[:]
-
-	// Placeholder signature for development, for "Iterate Intelligently".
-	// Generates a unique dummy signature based on time and proposer for robust testing.
-	dummySig := sha256.Sum256(append(b.HeaderForSigning(), []byte(time.Now().String())...))
-	b.Signature = append([]byte("empower1-signed-by-"), dummySig[:8]...) 
-	// log.Printf("BLOCK: Signed by %x, Dummy Signature: %x", b.ProposerAddress, b.Signature) // Use proper logging
-
-	return nil
-}
-
-// VerifySignature checks if the block's signature is valid for the ProposerAddress.
-// This is a placeholder that requires integration with a real cryptographic library.
-// It returns true if the signature is valid, false otherwise, along with any error.
-func (b *Block) VerifySignature() (bool, error) {
-	if len(b.ProposerAddress) == 0 {
-		return false, ErrMissingProposer
-	}
-	if len(b.Signature) == 0 {
-		return false, ErrMissingSignature
-	}
-
-	// In a real implementation:
-	// pubKey := ed25519.PublicKey(b.ProposerAddress) 
-	// isValid := ed25519.Verify(pubKey, b.HeaderForSigning(), b.Signature)
-	// return isValid, nil
-
-	// Placeholder verification, for "Iterate Intelligently".
-	expectedDummyPrefix := []byte("empower1-signed-by-")
-	if !bytes.HasPrefix(b.Signature, expectedDummyPrefix) {
-		// log.Printf("BLOCK: Invalid dummy signature format for %x", b.ProposerAddress) // Use proper logging
-		return false, ErrInvalidSignature
-	}
-	// log.Printf("BLOCK: Verified dummy signature for %x", b.ProposerAddress) // Use proper logging
-
-	return true, nil // Always true for dummy verification
-}
-
-// ValidateTransactions performs basic validation on all transactions in the block.
-// EmPower1: This is where AI/ML logic would conceptually aid in validation and flag anomalies.
-func (b *Block) ValidateTransactions() error {
-    for i, tx := range b.Transactions {
-        // Basic: check if tx.ID is correctly set (e.g., is hash of tx content)
-        if len(tx.ID) == 0 {
-            return fmt.Errorf("transaction %d has no ID", i)
+// Start initiates the consensus engine's operation.
+func (ce *ConsensusEngine) Start() error {
+    var err error
+    ce.startOnce.Do(func() {
+        if ce.isRunning.Load() {
+            err = ErrEngineAlreadyRunning
+            return
         }
-        // Basic: check for duplicate inputs/double spends (requires UTXO set access, conceptual here)
-        // For actual UTXO check, you'd need access to the blockchain state
-        
-        // EmPower1 Specific: Conceptual hook for AI/ML validation
-        // if b.AIAuditLog != nil { // if AI analysis included for this block
-        //     aiVerdict, err := ai_ml_module.AnalyzeTransactions(tx)
-        //     if err != nil {
-        //         return ErrAILogicFailure // Or log and continue if non-critical
-        //     }
-        //     if !aiVerdict.IsApproved() { // Example AI approval logic
-        //         return fmt.Errorf("transaction %d flagged by AI/ML for policy violation", i)
-        //     }
-        // }
+        ce.isRunning.Store(true)
+        ce.wg.Add(1)
+        go ce.engineLoop()
+        ce.wg.Add(1)
+        go ce.handleIncomingBlocks()
+        ce.logger.Println("ConsensusEngine started successfully.")
+    })
+    return err
+}
+
+// Stop gracefully shuts down the consensus engine.
+func (ce *ConsensusEngine) Stop() error {
+    var err error
+    ce.stopOnce.Do(func() {
+        if !ce.isRunning.Load() {
+            err = ErrEngineNotRunning
+            return
+        }
+        ce.cancel()
+        ce.wg.Wait()
+        ce.isRunning.Store(false)
+        ce.logger.Println("ConsensusEngine stopped gracefully.")
+    })
+    return err
+}
+
+// engineLoop is the main loop for the consensus engine.
+func (ce *ConsensusEngine) engineLoop() {
+    defer ce.wg.Done()
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+
+    ce.logger.Println("Consensus engine proposal loop started.")
+
+    for {
+        select {
+        case <-ce.ctx.Done():
+            ce.logger.Println("Consensus engine proposal loop received stop signal.")
+            return
+        case <-ticker.C:
+            currentChainHeight := ce.blockchain.ChainHeight()
+            if currentChainHeight == -1 {
+                ce.logger.Println("Blockchain is empty; proposal loop waiting for genesis block to sync or be created locally.")
+                continue
+            }
+            nextBlockHeight := currentChainHeight + 1
+            expectedProposer, err := ce.consensusState.GetProposerForHeight(nextBlockHeight)
+            if err != nil {
+                ce.logger.Printf("Failed to determine expected proposer for height %d: %v", nextBlockHeight, err)
+                continue
+            }
+            if ce.isValidator && bytes.Equal(ce.validatorAddress, expectedProposer.Address) {
+                ce.logger.Printf("It's OUR turn to propose block #%d! Proposer: %x", nextBlockHeight, ce.validatorAddress)
+                if err := ce.proposeBlock(nextBlockHeight); err != nil {
+                    ce.logger.Printf("Failed to propose block #%d: %v", nextBlockHeight, err)
+                }
+            }
+        }
     }
+}
+
+// proposeBlock orchestrates the creation, signing, and broadcasting of a new block proposal.
+func (ce *ConsensusEngine) proposeBlock(height int64) error {
+    lastBlock, err := ce.blockchain.GetLastBlock()
+    if err != nil {
+        return fmt.Errorf("%w: %v", ErrFailedToGetLastBlock, err)
+    }
+    proposal, err := ce.proposerService.CreateProposalBlock(height, lastBlock.Hash, lastBlock.Timestamp)
+    if err != nil {
+        return fmt.Errorf("%w: %v", ErrProposeBlockFailed, err)
+    }
+    if err := ce.network.BroadcastBlock(proposal); err != nil {
+        return fmt.Errorf("%w: failed to broadcast proposed block %d (%x): %v", ErrBroadcastFailed, height, proposal.Hash, err)
+    }
+    ce.logger.Printf("Proposed and broadcasted block #%d (%x) by %x. PrevHash: %x.", proposal.Height, proposal.Hash, proposal.ProposerAddress, proposal.PrevBlockHash)
     return nil
 }
 
-// encodeInt64 converts an int64 to a byte slice using BigEndian encoding.
-func encodeInt64(num int64) []byte {
-	buf := new(bytes.Buffer)
-	err := binary.Write(buf, binary.BigEndian, num)
-	if err != nil {
-		panic(fmt.Sprintf("failed to encode int64: %v", err)) 
-	}
-	return buf.Bytes()
+// handleIncomingBlocks listens for blocks received from the network and orchestrates their validation and addition.
+func (ce *ConsensusEngine) handleIncomingBlocks() {
+    defer ce.wg.Done()
+    ce.logger.Println("Incoming block processor started.")
+
+    for {
+        select {
+        case <-ce.ctx.Done():
+            ce.logger.Println("Incoming block processor received stop signal.")
+            return
+        case incomingBlock := <-ce.network.ReceiveBlocks():
+            if incomingBlock == nil {
+                ce.logger.Println("Received nil block from network. Skipping processing.")
+                continue
+            }
+            ce.logger.Printf("Received block #%d (%x) from network. Proposer: %x. PrevHash: %x",
+                incomingBlock.Height, incomingBlock.Hash, incomingBlock.ProposerAddress, incomingBlock.PrevBlockHash)
+            if err := ce.validationService.ValidateBlock(incomingBlock); err != nil {
+                ce.logger.Printf("Incoming block #%d (%x) is INVALID. Proposer: %x. Error: %v. Skipping add.",
+                    incomingBlock.Height, incomingBlock.Hash, incomingBlock.ProposerAddress, err)
+                continue
+            }
+            if err := ce.blockchain.AddBlock(incomingBlock); err != nil {
+                ce.logger.Printf("Failed to add VALIDATED block #%d (%x) to blockchain: %v", incomingBlock.Height, incomingBlock.Hash, err)
+                continue
+            }
+            if err := ce.consensusState.UpdateHeight(incomingBlock.Height); err != nil {
+                ce.logger.Printf("Failed to update consensus state height after adding block %d (%x): %v", incomingBlock.Height, incomingBlock.Hash, err)
+            }
+            ce.logger.Printf("Successfully processed block #%d (%x). ChainHeight: %d. ConsensusState Height: %d.",
+                incomingBlock.Height, incomingBlock.Hash, ce.blockchain.ChainHeight(), ce.consensusState.CurrentHeight())
+        }
+    }
 }
-
-// --- Placeholder for AI/ML Module Integration (Conceptual) ---
-// This would be a separate package/service that the blockchain node interacts with.
-// For EmPower1, this is critical for wealth gap analysis and redistribution logic.
-/*
-package ai_ml_module
-
-import (
-	"empower1/blockchain/core" // Assuming path to core package
-	"fmt"
-)
-
-// AIAnalysisVerdict represents the outcome of AI/ML analysis for a transaction or block.
-type AIAnalysisVerdict struct {
-	IsApproved bool
-	FlagReason string
-	Score      float64
-}
-
-// AnalyzeTransactions conceptually represents AI/ML analysis for a set of transactions.
-// This is where the AI/ML components analyze transaction data to gauge user wealth levels,
-// identify potential fraud, or flag transactions for redistribution.
-func AnalyzeTransactions(tx core.Transaction) (AIAnalysisVerdict, error) {
-	// Simulate AI/ML logic here. In a real system, this would involve:
-	// 1. Calling an external AI service or interacting with an on-chain AI oracle.
-	// 2. Complex algorithms to assess wealth levels from transaction patterns.
-	// 3. Identifying transactions that qualify for stimulus or taxation.
-
-	// Dummy logic for now: approve everything unless it's a "suspicious" type
-	if string(tx.TxType) == "suspicious" { // Conceptual TxType
-		return AIAnalysisVerdict{IsApproved: false, FlagReason: "Suspicious AI-flagged type"}, nil
-	}
-	if tx.Metadata != nil {
-		if _, ok := tx.Metadata["wealth_level"]; ok {
-			// Simulate a simple AI decision based on metadata
-			if tx.Metadata["wealth_level"] == "affluent" {
-				return AIAnalysisVerdict{IsApproved: true, FlagReason: "Flagged for potential tax", Score: 0.9}, nil
-			}
-		}
-	}
-	
-	fmt.Println("AI/ML: Analyzing transaction for wealth gap redistribution...")
-	return AIAnalysisVerdict{IsApproved: true, FlagReason: "Standard transaction"}, nil
-}
-
-// GenerateAIAuditLog conceptually generates a cryptographic hash of AI's decisions for a block.
-func GenerateAIAuditLog(block *core.Block) ([]byte, error) {
-	// This would involve hashing the collective decisions/metadata of the AI/ML
-	// for the transactions within this block, ensuring transparency of AI's role.
-	fmt.Println("AI/ML: Generating audit log for block...")
-	dummyLog := sha256.Sum256([]byte(fmt.Sprintf("AI-audit-for-block-%d-%s", block.Height, time.Now().String())))
-	return dummyLog[:], nil
-}
-*/
