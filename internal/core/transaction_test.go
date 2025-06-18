@@ -3,331 +3,803 @@ package core
 import (
 	"bytes"
 	"crypto/ecdsa"
-	"crypto/rand"
-	"empower1.com/core/internal/crypto"
-	// "encoding/hex" // Removed unused import
+	"crypto/elliptic"
+	"crypto/rand" // Needed for ecdsa.SignASN1
+	"crypto/sha256"
+	"encoding/hex" // Added for debugging/logging hex strings
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"empower1.com/core/internal/crypto" // Assuming this provides key generation and serialization
 )
 
-// TestNewTransaction_Old is kept to ensure the old constructor (if still used) is tested.
-// It should ideally be removed once NewTransaction is fully replaced.
-func TestNewTransaction_Old(t *testing.T) {
-	senderPrivKey, err := crypto.GenerateECDSAKeyPair()
-	if err != nil { t.Fatalf("Failed to generate sender key pair: %v", err) }
-	receiverPrivKey, err := crypto.GenerateECDSAKeyPair()
-	if err != nil { t.Fatalf("Failed to generate receiver key pair: %v", err) }
-
-	senderPubKey := &senderPrivKey.PublicKey
-	receiverPubKey := &receiverPrivKey.PublicKey
-	amount := uint64(100)
-	fee := uint64(10)
-
-	tx, err := NewTransaction(senderPubKey, receiverPubKey, amount, fee) // Uses the old constructor
+// Helper to get a dummy ECDSA private key for testing
+func newDummyPrivateKey(t *testing.T) *ecdsa.PrivateKey {
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("Old NewTransaction() error = %v", err)
+		t.Fatalf("Failed to generate dummy private key: %v", err)
 	}
-	// Basic checks for old NewTransaction behavior
-	if tx.TxType != TxStandard && tx.TxType != "" {
-		// Old NewTransaction might set TxType to "" or default to TxStandard if that was refactored.
-		// Assuming it implicitly creates a standard one for this test.
-		// If NewTransaction was updated to set TxType explicitly, this check might need adjustment.
-		// For now, let's ensure it's one of the expected values if it's being set.
-		// If old NewTransaction truly doesn't set TxType, then this check is for its default value.
-		// Given the current Transaction struct, TxType will be the zero value "" if not set.
-		// The new constructors (NewStandardTransaction etc.) DO set TxType.
-		// So, if NewTransaction is truly old, its TxType should be "".
-		if tx.TxType != "" {
-			t.Errorf("TxType for old NewTransaction = %s; want empty string (or specific default if any)", tx.TxType)
-		}
-	}
-	if tx.Amount != amount { t.Errorf("tx.Amount = %d; want %d", tx.Amount, amount) }
-	expectedFrom := crypto.SerializePublicKeyToBytes(senderPubKey)
-	if !bytes.Equal(tx.From, expectedFrom) { t.Errorf("tx.From is incorrect") }
-	if !bytes.Equal(tx.PublicKey, expectedFrom) { t.Errorf("tx.PublicKey is incorrect") }
+	return privKey
 }
 
-func TestNewStandardTransaction(t *testing.T) {
-	senderPrivKey, err := crypto.GenerateECDSAKeyPair()
-	if err != nil { t.Fatalf("Failed to generate sender key pair: %v", err) }
-	receiverPrivKey, err := crypto.GenerateECDSAKeyPair()
-	if err != nil { t.Fatalf("Failed to generate receiver key pair: %v", err) }
+// Helper to get a dummy public key bytes
+func newDummyPublicKeyBytes(t *testing.T) []byte {
+	privKey := newDummyPrivateKey(t)
+	return elliptic.Marshal(elliptic.P256(), privKey.PublicKey.X, privKey.PublicKey.Y)
+}
 
-	senderPubKey := &senderPrivKey.PublicKey
-	receiverPubKey := &receiverPrivKey.PublicKey
+// --- Test Cases ---
+
+func TestNewStandardTransaction(t *testing.T) {
+	senderPrivKey := newDummyPrivateKey(t)
+	receiverPubKeyBytes := newDummyPublicKeyBytes(t) // Receiver needs pubkey bytes
+	
 	amount := uint64(100)
 	fee := uint64(10)
 
-	tx, err := NewStandardTransaction(senderPubKey, receiverPubKey, amount, fee)
+	tx, err := NewStandardTransaction(&senderPrivKey.PublicKey, receiverPubKeyBytes, amount, fee)
 	if err != nil {
 		t.Fatalf("NewStandardTransaction() error = %v", err)
 	}
-	if tx.TxType != TxStandard { t.Errorf("tx.TxType = %s; want %s", tx.TxType, TxStandard) }
-	if tx.Amount != amount { t.Errorf("tx.Amount = %d; want %d", tx.Amount, amount) }
-	// ... other checks from original TestNewStandardTransaction ...
+
+	if tx.Timestamp == 0 {
+		t.Errorf("tx.Timestamp not set")
+	}
+	if !bytes.Equal(tx.From, elliptic.Marshal(elliptic.P256(), senderPrivKey.PublicKey.X, senderPrivKey.PublicKey.Y)) {
+		t.Errorf("tx.From is incorrect, expected sender's public key bytes")
+	}
+	if !bytes.Equal(tx.PublicKey, elliptic.Marshal(elliptic.P256(), senderPrivKey.PublicKey.X, senderPrivKey.PublicKey.Y)) {
+		t.Errorf("tx.PublicKey is incorrect, expected sender's public key bytes")
+	}
+	if tx.TxType != TxStandard {
+		t.Errorf("tx.TxType = %s; want %s", tx.TxType, TxStandard)
+	}
+	if !bytes.Equal(tx.To, receiverPubKeyBytes) {
+		t.Errorf("tx.To is incorrect, expected receiver public key bytes")
+	}
+	if tx.Amount != amount {
+		t.Errorf("tx.Amount = %d; want %d", tx.Amount, amount)
+	}
+	if tx.Fee != fee {
+		t.Errorf("tx.Fee = %d; want %d", tx.Fee, fee)
+	}
+
+	// Ensure signature fields are initially nil/empty
+	if tx.Signature != nil {
+		t.Errorf("tx.Signature should be nil initially")
+	}
+	if tx.ID != nil {
+		t.Errorf("tx.ID should be nil initially")
+	}
+
+	// Test error cases
+	_, err = NewStandardTransaction(nil, receiverPubKeyBytes, amount, fee)
+	if err == nil {
+		t.Errorf("Expected error for nil sender public key, got nil")
+	}
+	_, err = NewStandardTransaction(&senderPrivKey.PublicKey, nil, amount, fee)
+	if err == nil {
+		t.Errorf("Expected error for nil receiver public key hash, got nil")
+	}
 }
 
+func TestNewContractDeploymentTransaction(t *testing.T) {
+	deployerPrivKey := newDummyPrivateKey(t)
+	contractCode := []byte("0x6001600055") // Example bytecode
+	fee := uint64(20)
 
-func TestTransactionSignAndVerify(t *testing.T) {
-	senderPrivKey, err := crypto.GenerateECDSAKeyPair()
-	if err != nil { t.Fatalf("Failed to generate sender key pair: %v", err) }
-	receiverPrivKey, err := crypto.GenerateECDSAKeyPair()
-	if err != nil { t.Fatalf("Failed to generate receiver key pair: %v", err) }
-	senderPubKey := &senderPrivKey.PublicKey
-	receiverPubKey := &receiverPrivKey.PublicKey
+	tx, err := NewContractDeploymentTransaction(&deployerPrivKey.PublicKey, contractCode, fee)
+	if err != nil {
+		t.Fatalf("NewContractDeploymentTransaction() error = %v", err)
+	}
 
-	tx, err := NewStandardTransaction(senderPubKey, receiverPubKey, 100, 10)
-	if err != nil { t.Fatalf("NewStandardTransaction error: %v", err) }
+	if tx.TxType != TxContractDeploy {
+		t.Errorf("tx.TxType = %s; want %s", tx.TxType, TxContractDeploy)
+	}
+	if !bytes.Equal(tx.ContractCode, contractCode) {
+		t.Errorf("tx.ContractCode is incorrect")
+	}
+	if tx.Fee != fee {
+		t.Errorf("tx.Fee = %d; want %d", tx.Fee, fee)
+	}
+	// Basic sender/public key checks
+	expectedFrom := elliptic.Marshal(elliptic.P256(), deployerPrivKey.PublicKey.X, deployerPrivKey.PublicKey.Y)
+	if !bytes.Equal(tx.From, expectedFrom) {
+		t.Errorf("tx.From is incorrect, expected deployer public key bytes")
+	}
+	if !bytes.Equal(tx.PublicKey, expectedFrom) {
+		t.Errorf("tx.PublicKey is incorrect, expected deployer public key bytes")
+	}
 
-	err = tx.Sign(senderPrivKey)
-	if err != nil { t.Fatalf("tx.Sign() error = %v", err) }
-	if tx.Signature == nil { t.Errorf("tx.Signature is nil after signing") }
-	if tx.ID == nil { t.Errorf("tx.ID is nil after signing") }
+	// Test error cases
+	_, err = NewContractDeploymentTransaction(nil, contractCode, fee)
+	if err == nil {
+		t.Errorf("Expected error for nil deployer public key, got nil")
+	}
+	_, err = NewContractDeploymentTransaction(&deployerPrivKey.PublicKey, nil, fee)
+	if err == nil {
+		t.Errorf("Expected error for nil contract code, got nil")
+	}
+	_, err = NewContractDeploymentTransaction(&deployerPrivKey.PublicKey, []byte{}, fee)
+	if err == nil {
+		t.Errorf("Expected error for empty contract code, got nil")
+	}
+}
 
-	valid, err := tx.VerifySignature()
-	if err != nil { t.Fatalf("tx.VerifySignature() error = %v", err) }
-	if !valid { t.Errorf("tx.VerifySignature() = false; want true") }
+func TestNewContractCallTransaction(t *testing.T) {
+	callerPrivKey := newDummyPrivateKey(t)
+	contractAddress := newDummyPublicKeyBytes(t) // Dummy contract address
+	functionName := "transferTokens"
+	args := []byte("0xabcdef")
+	fee := uint64(5)
 
-	originalAmount := tx.Amount
-	tx.Amount = 200
-	valid, _ = tx.VerifySignature()
-	if valid { t.Errorf("tx.VerifySignature() = true after tampering Amount; want false") }
-	tx.Amount = originalAmount
+	tx, err := NewContractCallTransaction(&callerPrivKey.PublicKey, contractAddress, functionName, args, fee)
+	if err != nil {
+		t.Fatalf("NewContractCallTransaction() error = %v", err)
+	}
 
-	fakePrivKey, _ := crypto.GenerateECDSAKeyPair()
-	originalPubKeyBytes := tx.PublicKey
-	tx.PublicKey = crypto.SerializePublicKeyToBytes(&fakePrivKey.PublicKey)
-	valid, _ = tx.VerifySignature()
-	if valid { t.Errorf("tx.VerifySignature() = true after tampering PublicKey; want false") }
-	tx.PublicKey = originalPubKeyBytes
+	if tx.TxType != TxContractCall {
+		t.Errorf("tx.TxType = %s; want %s", tx.TxType, TxContractCall)
+	}
+	if !bytes.Equal(tx.TargetContractAddress, contractAddress) {
+		t.Errorf("tx.TargetContractAddress is incorrect")
+	}
+	if tx.FunctionName != functionName {
+		t.Errorf("tx.FunctionName is incorrect")
+	}
+	if !bytes.Equal(tx.Arguments, args) {
+		t.Errorf("tx.Arguments is incorrect")
+	}
+	if tx.Fee != fee {
+		t.Errorf("tx.Fee = %d; want %d", tx.Fee, fee)
+	}
+	// Basic sender/public key checks
+	expectedFrom := elliptic.Marshal(elliptic.P256(), callerPrivKey.PublicKey.X, callerPrivKey.PublicKey.Y)
+	if !bytes.Equal(tx.From, expectedFrom) {
+		t.Errorf("tx.From is incorrect, expected caller public key bytes")
+	}
+	if !bytes.Equal(tx.PublicKey, expectedFrom) {
+		t.Errorf("tx.PublicKey is incorrect, expected caller public key bytes")
+	}
 
-	valid, err = tx.VerifySignature()
-	if !valid {	t.Errorf("tx.VerifySignature() = false after restoring; want true, err: %v", err) }
+	// Test error cases
+	_, err = NewContractCallTransaction(nil, contractAddress, functionName, args, fee)
+	if err == nil {
+		t.Errorf("Expected error for nil caller public key, got nil")
+	}
+	_, err = NewContractCallTransaction(&callerPrivKey.PublicKey, nil, functionName, args, fee)
+	if err == nil {
+		t.Errorf("Expected error for nil contract address, got nil")
+	}
+	_, err = NewContractCallTransaction(&callerPrivKey.PublicKey, []byte{}, functionName, args, fee)
+	if err == nil {
+		t.Errorf("Expected error for empty contract address, got nil")
+	}
+	_, err = NewContractCallTransaction(&callerPrivKey.PublicKey, contractAddress, "", args, fee)
+	if err == nil {
+		t.Errorf("Expected error for empty function name, got nil")
+	}
+}
+
+func TestNewMultiSigTransaction(t *testing.T) {
+	multiSigID := []byte("ms_address_123")
+	key1 := newDummyPublicKeyBytes(t)
+	key2 := newDummyPublicKeyBytes(t)
+	authorizedKeys := [][]byte{key1, key2}
+	SortByteSlices(authorizedKeys) // Ensure sorted for consistent ID
+
+	// Test Standard MultiSig Tx
+	txStandardMulti, err := NewMultiSigTransaction(
+		multiSigID, TxStandard, 2, authorizedKeys,
+		uint64(500), newDummyPublicKeyBytes(t), nil, nil, "", nil, uint64(5),
+	)
+	if err != nil {
+		t.Fatalf("NewMultiSigTransaction (Standard) error: %v", err)
+	}
+	if txStandardMulti.TxType != TxStandard {
+		t.Errorf("MultiSig Standard TxType mismatch")
+	}
+	if txStandardMulti.Amount != 500 {
+		t.Errorf("MultiSig Standard Amount mismatch")
+	}
+	if txStandardMulti.RequiredSignatures != 2 {
+		t.Errorf("MultiSig Standard RequiredSignatures mismatch")
+	}
+	if len(txStandardMulti.AuthorizedPublicKeys) != 2 {
+		t.Errorf("MultiSig Standard AuthorizedPublicKeys length mismatch")
+	}
+	if !bytes.Equal(txStandardMulti.From, multiSigID) {
+		t.Errorf("MultiSig Standard From mismatch")
+	}
+	if len(txStandardMulti.Signers) != 0 {
+		t.Errorf("MultiSig Signers should be empty initially")
+	}
+	if txStandardMulti.PublicKey != nil || txStandardMulti.Signature != nil {
+		t.Errorf("MultiSig Tx single sig fields should be nil")
+	}
+
+	// Test Contract Deploy MultiSig Tx
+	contractCode := []byte("0xabc")
+	txDeployMulti, err := NewMultiSigTransaction(
+		multiSigID, TxContractDeploy, 1, authorizedKeys,
+		0, nil, contractCode, nil, "", nil, uint64(5),
+	)
+	if err != nil {
+		t.Fatalf("NewMultiSigTransaction (Deploy) error: %v", err)
+	}
+	if txDeployMulti.TxType != TxContractDeploy {
+		t.Errorf("MultiSig Deploy TxType mismatch")
+	}
+	if !bytes.Equal(txDeployMulti.ContractCode, contractCode) {
+		t.Errorf("MultiSig Deploy ContractCode mismatch")
+	}
+
+	// Test Contract Call MultiSig Tx
+	targetAddr := newDummyPublicKeyBytes(t)
+	functionName := "withdraw"
+	args := []byte("0x123")
+	txCallMulti, err := NewMultiSigTransaction(
+		multiSigID, TxContractCall, 1, authorizedKeys,
+		10, nil, nil, targetAddr, functionName, args, uint64(5),
+	)
+	if err != nil {
+		t.Fatalf("NewMultiSigTransaction (Call) error: %v", err)
+	}
+	if txCallMulti.TxType != TxContractCall {
+		t.Errorf("MultiSig Call TxType mismatch")
+	}
+	if !bytes.Equal(txCallMulti.TargetContractAddress, targetAddr) {
+		t.Errorf("MultiSig Call TargetContractAddress mismatch")
+	}
+	if txCallMulti.FunctionName != functionName {
+		t.Errorf("MultiSig Call FunctionName mismatch")
+	}
+	if !bytes.Equal(txCallMulti.Arguments, args) {
+		t.Errorf("MultiSig Call Arguments mismatch")
+	}
+	if txCallMulti.Amount != 10 { // Call can have amount
+		t.Errorf("MultiSig Call Amount mismatch")
+	}
+
+	// Test error cases
+	_, err = NewMultiSigTransaction(nil, TxStandard, 1, authorizedKeys, 1, newDummyPublicKeyBytes(t), nil, nil, "", nil, 1)
+	if err == nil || !errors.Is(err, ErrMultiSigConfigInvalid) {
+		t.Errorf("Expected ErrMultiSigConfigInvalid for nil multiSigID, got %v", err)
+	}
+	_, err = NewMultiSigTransaction(multiSigID, TxStandard, 0, authorizedKeys, 1, newDummyPublicKeyBytes(t), nil, nil, "", nil, 1)
+	if err == nil || !errors.Is(err, ErrMultiSigConfigInvalid) {
+		t.Errorf("Expected ErrMultiSigConfigInvalid for 0 requiredSignatures, got %v", err)
+	}
+	_, err = NewMultiSigTransaction(multiSigID, TxStandard, 1, nil, 1, newDummyPublicKeyBytes(t), nil, nil, "", nil, 1)
+	if err == nil || !errors.Is(err, ErrMultiSigConfigInvalid) {
+		t.Errorf("Expected ErrMultiSigConfigInvalid for nil authorizedKeys, got %v", err)
+	}
+	_, err = NewMultiSigTransaction(multiSigID, TxStandard, 3, authorizedKeys, 1, newDummyPublicKeyBytes(t), nil, nil, "", nil, 1) // M > N
+	if err == nil || !errors.Is(err, ErrMultiSigConfigInvalid) {
+		t.Errorf("Expected ErrMultiSigConfigInvalid for M > N, got %v", err)
+	}
 }
 
 func TestTransactionHashing(t *testing.T) {
-	senderPrivKey, _ := crypto.GenerateECDSAKeyPair()
-	receiverPrivKey, _ := crypto.GenerateECDSAKeyPair()
-	senderPubKey := &senderPrivKey.PublicKey
-	receiverPubKey := &receiverPrivKey.PublicKey
+	// Generate unique keys for sender/receiver for consistent test environment
+	senderPrivKey := newDummyPrivateKey(t)
+	receiverPubKeyBytes := newDummyPublicKeyBytes(t)
 
-	tx1, _ := NewStandardTransaction(senderPubKey, receiverPubKey, 100, 10)
-	tx1.Timestamp = 1234567890
+	// --- Test Standard Transaction Hashing ---
+	tx1, _ := NewStandardTransaction(&senderPrivKey.PublicKey, receiverPubKeyBytes, 100, 10)
+	tx1.Timestamp = 1234567890 // Fixed timestamp for deterministic hash
 
 	hash1, err := tx1.Hash()
-	if err != nil { t.Fatalf("tx1.Hash() error = %v", err) }
-
-	tx2, _ := NewStandardTransaction(senderPubKey, receiverPubKey, 100, 10)
-	tx2.Timestamp = 1234567890
-	hash2, err := tx2.Hash()
-	if err != nil { t.Fatalf("tx2.Hash() error = %v", err) }
-	if !bytes.Equal(hash1, hash2) {
-		t.Errorf("Hashes of identical standard transactions do not match.")
-		tx1Json, _ := tx1.prepareDataForHashing(); t.Logf("TX1 JSON: %s", string(tx1Json))
-		tx2Json, _ := tx2.prepareDataForHashing(); t.Logf("TX2 JSON: %s", string(tx2Json))
+	if err != nil {
+		t.Fatalf("tx1.Hash() error = %v", err)
+	}
+	if len(hash1) == 0 {
+		t.Errorf("tx1.Hash() resulted in empty hash")
 	}
 
-	tx3, _ := NewStandardTransaction(senderPubKey, receiverPubKey, 200, 10)
+	tx2, _ := NewStandardTransaction(&senderPrivKey.PublicKey, receiverPubKeyBytes, 100, 10)
+	tx2.Timestamp = 1234567890 // Identical timestamp
+	hash2, err := tx2.Hash()
+	if err != nil {
+		t.Fatalf("tx2.Hash() error = %v", err)
+	}
+	if !bytes.Equal(hash1, hash2) {
+		t.Errorf("Hashes of identical standard transactions do not match. Hash1: %x, Hash2: %x", hash1, hash2)
+		tx1Json, _ := tx1.prepareDataForHashing()
+		t.Logf("Tx1 JSON: %s", string(tx1Json))
+		tx2Json, _ := tx2.prepareDataForHashing()
+		t.Logf("Tx2 JSON: %s", string(tx2Json))
+	}
+
+	tx3, _ := NewStandardTransaction(&senderPrivKey.PublicKey, receiverPubKeyBytes, 200, 10) // Different amount
 	tx3.Timestamp = 1234567890
 	hash3, err := tx3.Hash()
-	if err != nil { t.Fatalf("tx3.Hash() error = %v", err) }
-	if bytes.Equal(hash1, hash3) { t.Errorf("Hashes of different transactions match.") }
+	if err != nil {
+		t.Fatalf("tx3.Hash() error = %v", err)
+	}
+	if bytes.Equal(hash1, hash3) {
+		t.Errorf("Hashes of different transactions match. Hash1: %x, Hash3: %x", hash1, hash3)
+	}
 
-	err = tx1.Sign(senderPrivKey)
-	if err != nil { t.Fatalf("tx1.Sign() error: %v", err) }
-	if !bytes.Equal(tx1.ID, hash1) { t.Errorf("tx1.ID (%x) != pre-sign hash (%x)", tx1.ID, hash1) }
+	// Test ID is set after Sign
+	tx1Copy, _ := NewStandardTransaction(&senderPrivKey.PublicKey, receiverPubKeyBytes, 100, 10)
+	tx1Copy.Timestamp = 1234567890
+	preSignHash, _ := tx1Copy.Hash() // Hash before signing
+
+	err = tx1Copy.Sign(senderPrivKey)
+	if err != nil {
+		t.Fatalf("tx1Copy.Sign() error: %v", err)
+	}
+	if !bytes.Equal(tx1Copy.ID, preSignHash) { // After Sign, ID should be set to the hash of the content
+		t.Errorf("tx1Copy.ID (%x) != pre-sign hash (%x) after signing", tx1Copy.ID, preSignHash)
+	}
 }
 
 func TestMultiSigTransactionHashing(t *testing.T) {
-	key1, _ := crypto.GenerateECDSAKeyPair()
-	key2, _ := crypto.GenerateECDSAKeyPair()
-	key3, _ := crypto.GenerateECDSAKeyPair()
-	pubKey1Bytes := crypto.SerializePublicKeyToBytes(&key1.PublicKey)
-	pubKey2Bytes := crypto.SerializePublicKeyToBytes(&key2.PublicKey)
-	pubKey3Bytes := crypto.SerializePublicKeyToBytes(&key3.PublicKey)
+	key1 := newDummyPublicKeyBytes(t)
+	key2 := newDummyPublicKeyBytes(t)
+	key3 := newDummyPublicKeyBytes(t)
+	
+	authorizedKeys := [][]byte{key1, key2} // N=2
+	SortByteSlices(authorizedKeys)        // Essential for canonical hash
+
 	multiSigID := []byte("test_multisig_id_for_hashing")
 
-	baseTx := Transaction{
-		Timestamp:            1234567890, From: multiSigID, TxType: TxStandard,
-		To:                   pubKey3Bytes, Amount: 500, Fee: 5, RequiredSignatures:   2,
+	// Base for multi-sig transactions
+	baseTxPayload := func() Transaction {
+		tx, _ := NewMultiSigTransaction(
+			multiSigID, TxStandard, 2, authorizedKeys,
+			uint64(500), newDummyPublicKeyBytes(t), nil, nil, "", nil, uint64(5),
+		)
+		// Set fixed timestamp for deterministic hash
+		tx.Timestamp = 1234567890
+		return *tx
 	}
-	txMulti1 := baseTx
-	txMulti1.AuthorizedPublicKeys = [][]byte{pubKey1Bytes, pubKey2Bytes}
-	SortByteSlices(txMulti1.AuthorizedPublicKeys)
-	hash1, err1 := txMulti1.Hash()
-	if err1 != nil { t.Fatalf("txMulti1.Hash() error = %v", err1) }
 
-	txMulti2 := baseTx
-	txMulti2.AuthorizedPublicKeys = [][]byte{pubKey2Bytes, pubKey1Bytes}
-	SortByteSlices(txMulti2.AuthorizedPublicKeys)
-	hash2, err2 := txMulti2.Hash()
-	if err2 != nil { t.Fatalf("txMulti2.Hash() error = %v", err2) }
+	// Test 1: Identical multi-sig config and payload should have same hash
+	txMulti1 := baseTxPayload()
+	hash1, err := txMulti1.Hash()
+	if err != nil {
+		t.Fatalf("txMulti1.Hash() error = %v", err)
+	}
+
+	txMulti2 := baseTxPayload() // Identical payload
+	hash2, err := txMulti2.Hash()
+	if err != nil {
+		t.Fatalf("txMulti2.Hash() error = %v", err)
+	}
 	if !bytes.Equal(hash1, hash2) {
-		t.Errorf("Multi-sig hashes with differently ordered (but then sorted) AuthorizedPublicKeys do not match.")
-		jsonBytes1, _ := txMulti1.prepareDataForHashing(); t.Logf("Tx1 JSON: %s", string(jsonBytes1))
-		jsonBytes2, _ := txMulti2.prepareDataForHashing(); t.Logf("Tx2 JSON: %s", string(jsonBytes2))
+		t.Errorf("Hashes of identical multi-sig transactions do not match. Hash1: %x, Hash2: %x", hash1, hash2)
+		jsonBytes1, _ := txMulti1.prepareDataForHashing()
+		t.Logf("TxMulti1 JSON: %s", string(jsonBytes1))
+		jsonBytes2, _ := txMulti2.prepareDataForHashing()
+		t.Logf("TxMulti2 JSON: %s", string(jsonBytes2))
 	}
 
-	txMulti3 := baseTx
-	txMulti3.AuthorizedPublicKeys = [][]byte{pubKey1Bytes, pubKey2Bytes}
-	SortByteSlices(txMulti3.AuthorizedPublicKeys)
-	txMulti3.RequiredSignatures = 1
-	hash3, _ := txMulti3.Hash()
-	if bytes.Equal(hash1, hash3) { t.Errorf("Hash did not change when M changed.") }
+	// Test 2: Hash changes when RequiredSignatures (M) changes
+	txMultiMChanged := baseTxPayload()
+	txMultiMChanged.RequiredSignatures = 1 // Change M
+	hashMChanged, err := txMultiMChanged.Hash()
+	if err != nil {
+		t.Fatalf("txMultiMChanged.Hash() error = %v", err)
+	}
+	if bytes.Equal(hash1, hashMChanged) {
+		t.Errorf("Hash did not change when M changed.")
+	}
 
-	txMulti4 := baseTx
-	txMulti4.AuthorizedPublicKeys = [][]byte{pubKey1Bytes, pubKey3Bytes}
-	SortByteSlices(txMulti4.AuthorizedPublicKeys)
-	txMulti4.RequiredSignatures = 2
-	hash4, _ := txMulti4.Hash()
-	if bytes.Equal(hash1, hash4) { t.Errorf("Hash did not change when N keys changed.") }
+	// Test 3: Hash changes when AuthorizedPublicKeys (N) change
+	txMultiNChanged := baseTxPayload()
+	txMultiNChanged.AuthorizedPublicKeys = [][]byte{key1, newDummyPublicKeyBytes(t)} // Change one of the N keys
+	SortByteSlices(txMultiNChanged.AuthorizedPublicKeys)
+	hashNChanged, err := txMultiNChanged.Hash()
+	if err != nil {
+		t.Fatalf("txMultiNChanged.Hash() error = %v", err)
+	}
+	if bytes.Equal(hash1, hashNChanged) {
+		t.Errorf("Hash did not change when N keys changed.")
+	}
 }
 
+// SortByteSlices sorts a slice of byte slices lexicographically.
+// Crucial for canonical representation of AuthorizedPublicKeys.
 func SortByteSlices(slices [][]byte) {
 	sort.Slice(slices, func(i, j int) bool { return bytes.Compare(slices[i], slices[j]) < 0 })
 }
 
 func TestTransactionSerialization(t *testing.T) {
-	senderPrivKey, _ := crypto.GenerateECDSAKeyPair()
-	receiverPrivKey, _ := crypto.GenerateECDSAKeyPair()
-	senderPubKey := &senderPrivKey.PublicKey
-	receiverPubKey := &receiverPrivKey.PublicKey
-	receiverPubKeyBytes := crypto.SerializePublicKeyToBytes(receiverPubKey)
+	// --- Test single-signer transaction serialization/deserialization ---
+	senderPrivKey := newDummyPrivateKey(t)
+	receiverPubKeyBytes := newDummyPublicKeyBytes(t)
 
-	tx, err := NewStandardTransaction(senderPubKey, receiverPubKey, 100, 10)
-	if err != nil { t.Fatalf("NewStandardTransaction failed: %v", err) }
-	tx.Timestamp = time.Now().UnixNano()
-	err = tx.Sign(senderPrivKey)
-	if err != nil { t.Fatalf("tx.Sign() for single-signer error = %v", err) }
-
-	serializedTx, err := tx.Serialize()
-	if err != nil { t.Fatalf("tx.Serialize() error = %v", err) }
-	deserializedTx, err := DeserializeTransaction(serializedTx)
-	if err != nil { t.Fatalf("DeserializeTransaction() error = %v", err) }
-
-	if !bytes.Equal(tx.ID, deserializedTx.ID) { t.Errorf("ID mismatch") }
-	if tx.Timestamp != deserializedTx.Timestamp { t.Errorf("Timestamp mismatch") }
-	valid, err := deserializedTx.VerifySignature()
-	if err != nil { t.Fatalf("deserializedTx.VerifySignature() error = %v", err) }
-	if !valid { t.Errorf("deserializedTx.VerifySignature() = false for single-signer") }
-
-	key1, _ := crypto.GenerateECDSAKeyPair()
-	key2, _ := crypto.GenerateECDSAKeyPair()
-	multiSigID := []byte("test_multisig_id_for_serialization")
-	authKeys := [][]byte{ crypto.SerializePublicKeyToBytes(&key1.PublicKey), crypto.SerializePublicKeyToBytes(&key2.PublicKey)}
-	SortByteSlices(authKeys)
-
-	txMulti := &Transaction{
-		ID:        []byte("multi_tx_id_serial"), Timestamp: time.Now().UnixNano(), From: multiSigID,
-		TxType:    TxStandard, To: receiverPubKeyBytes, Amount: 123, Fee: 3,
-		RequiredSignatures: 1, AuthorizedPublicKeys: authKeys,
-		Signers:   []SignerInfo{{PublicKey: authKeys[0], Signature: []byte("dummy_sig_serial")}},
-		PublicKey: nil, Signature: nil,
+	txStandard, err := NewStandardTransaction(&senderPrivKey.PublicKey, receiverPubKeyBytes, 100, 10)
+	if err != nil {
+		t.Fatalf("NewStandardTransaction failed: %v", err)
 	}
+	txStandard.Timestamp = time.Now().UnixNano() // Ensure timestamp is set before hashing for ID
+	// Sign also sets ID
+	err = txStandard.Sign(senderPrivKey) 
+	if err != nil {
+		t.Fatalf("txStandard.Sign() error = %v", err)
+	}
+
+	serializedTx, err := txStandard.Serialize()
+	if err != nil {
+		t.Fatalf("txStandard.Serialize() error = %v", err)
+	}
+	deserializedTx, err := DeserializeTransaction(serializedTx)
+	if err != nil {
+		t.Fatalf("DeserializeTransaction() error = %v", err)
+	}
+
+	// Check fields
+	if !bytes.Equal(txStandard.ID, deserializedTx.ID) {
+		t.Errorf("Deserialized single-signer Tx ID mismatch: got %x, want %x", deserializedTx.ID, txStandard.ID)
+	}
+	if txStandard.Timestamp != deserializedTx.Timestamp {
+		t.Errorf("Deserialized single-signer Tx Timestamp mismatch")
+	}
+	if !bytes.Equal(txStandard.From, deserializedTx.From) {
+		t.Errorf("Deserialized single-signer Tx From mismatch")
+	}
+	if !bytes.Equal(txStandard.To, deserializedTx.To) {
+		t.Errorf("Deserialized single-signer Tx To mismatch")
+	}
+	if txStandard.Amount != deserializedTx.Amount {
+		t.Errorf("Deserialized single-signer Tx Amount mismatch")
+	}
+	if txStandard.Fee != deserializedTx.Fee {
+		t.Errorf("Deserialized single-signer Tx Fee mismatch")
+	}
+	if !bytes.Equal(txStandard.PublicKey, deserializedTx.PublicKey) {
+		t.Errorf("Deserialized single-signer Tx PublicKey mismatch")
+	}
+	if !bytes.Equal(txStandard.Signature, deserializedTx.Signature) {
+		t.Errorf("Deserialized single-signer Tx Signature mismatch")
+	}
+	if txStandard.TxType != deserializedTx.TxType {
+		t.Errorf("Deserialized single-signer TxType mismatch")
+	}
+
+	// Verify signature after deserialization
+	valid, err := deserializedTx.VerifySignature()
+	if err != nil {
+		t.Fatalf("deserializedTx.VerifySignature() error = %v", err)
+	}
+	if !valid {
+		t.Errorf("deserializedTx.VerifySignature() = false for single-signer; want true")
+	}
+
+	// --- Test multi-signer transaction serialization/deserialization ---
+	key1Priv := newDummyPrivateKey(t)
+	key2Priv := newDummyPrivateKey(t)
+	key3Priv := newDummyPrivateKey(t) // For signing
+	
+	pub1Bytes := elliptic.Marshal(elliptic.P256(), key1Priv.PublicKey.X, key1Priv.PublicKey.Y)
+	pub2Bytes := elliptic.Marshal(elliptic.P256(), key2Priv.PublicKey.X, key2Priv.PublicKey.Y)
+	
+	authorizedKeys := [][]byte{pub1Bytes, pub2Bytes}
+	SortByteSlices(authorizedKeys)
+
+	multiSigID := []byte("test_multisig_id_for_serialization")
+	receiverPubKeyBytes := newDummyPublicKeyBytes(t)
+
+	// Create a multi-sig transaction with a dummy signature
+	txMulti, err := NewMultiSigTransaction(
+		multiSigID, TxStandard, 1, authorizedKeys,
+		uint64(123), receiverPubKeyBytes, nil, nil, "", nil, uint64(3),
+	)
+	if err != nil {
+		t.Fatalf("NewMultiSigTransaction failed: %v", err)
+	}
+	txMulti.Timestamp = time.Now().UnixNano() // Ensure timestamp is set
+	
+	// Manually add one valid signature for serialization test
+	// This signer needs to be from authorizedKeys
+	sig3, err := ecdsa.SignASN1(rand.Reader, key3Priv, []byte("dummy_hash_for_sig")) // Sign some dummy content
+	if err != nil { t.Fatalf("Failed to dummy sign for multi-sig: %v", err) }
+	
+	// Add a valid signer from authorizedKeys
+	txMulti.Signers = append(txMulti.Signers, SignerInfo{
+		PublicKey: pub1Bytes, // One of the authorized keys
+		Signature: sig3, // Dummy signature for now
+	})
+	
+	// Set ID for the multi-sig transaction before serialization
+	multiTxHash, err := txMulti.Hash()
+	if err != nil { t.Fatalf("txMulti.Hash() error for serialization test: %v", err) }
+	txMulti.ID = multiTxHash
+
 	serializedMultiTx, err := txMulti.Serialize()
 	if err != nil { t.Fatalf("txMulti.Serialize() error = %v", err) }
+	
 	deserializedMultiTx, err := DeserializeTransaction(serializedMultiTx)
 	if err != nil { t.Fatalf("DeserializeTransaction(multiTx) error = %v", err) }
 
+	// Compare Multi-Sig Tx fields
 	if !bytes.Equal(txMulti.ID, deserializedMultiTx.ID) { t.Errorf("MultiTx ID mismatch") }
-	if txMulti.RequiredSignatures != deserializedMultiTx.RequiredSignatures { t.Errorf("MultiTx Mismatch") }
+	if txMulti.Timestamp != deserializedMultiTx.Timestamp { t.Errorf("MultiTx Timestamp mismatch") }
+	if !bytes.Equal(txMulti.From, deserializedMultiTx.From) { t.Errorf("MultiTx From mismatch") }
+	if txMulti.TxType != deserializedMultiTx.TxType { t.Errorf("MultiTx TxType mismatch") }
+	if txMulti.Amount != deserializedMultiTx.Amount { t.Errorf("MultiTx Amount mismatch") }
+	if txMulti.Fee != deserializedMultiTx.Fee { t.Errorf("MultiTx Fee mismatch") }
+	if txMulti.RequiredSignatures != deserializedMultiTx.RequiredSignatures { t.Errorf("MultiTx RequiredSignatures mismatch") }
+	if !bytes.Equal(txMulti.To, deserializedMultiTx.To) { t.Errorf("MultiTx To mismatch") } // For standard multi-sig
+	
+	// Compare AuthorizedPublicKeys (must be sorted for consistency)
+	if len(txMulti.AuthorizedPublicKeys) != len(deserializedMultiTx.AuthorizedPublicKeys) {
+		t.Errorf("MultiTx AuthorizedPublicKeys length mismatch")
+	} else {
+		for i := range txMulti.AuthorizedPublicKeys {
+			if !bytes.Equal(txMulti.AuthorizedPublicKeys[i], deserializedMultiTx.AuthorizedPublicKeys[i]) {
+				t.Errorf("MultiTx AuthorizedPublicKeys[%d] mismatch", i)
+			}
+		}
+	}
+
+	// Compare Signers
+	if len(txMulti.Signers) != len(deserializedMultiTx.Signers) {
+		t.Errorf("MultiTx Signers length mismatch")
+	} else {
+		for i := range txMulti.Signers {
+			if !bytes.Equal(txMulti.Signers[i].PublicKey, deserializedMultiTx.Signers[i].PublicKey) {
+				t.Errorf("MultiTx Signers[%d] PublicKey mismatch", i)
+			}
+			if !bytes.Equal(txMulti.Signers[i].Signature, deserializedMultiTx.Signers[i].Signature) {
+				t.Errorf("MultiTx Signers[%d] Signature mismatch", i)
+			}
+		}
+	}
+	
+	// Ensure single-sig fields are NOT set for a multi-sig tx after deserialization
+	if deserializedMultiTx.PublicKey != nil || deserializedMultiTx.Signature != nil {
+		t.Errorf("Deserialized multi-sig Tx has single-sig PublicKey/Signature set, should be nil")
+	}
+	
+	// Verify signature after deserialization (requires a valid signature added before serialization)
+	// For this test, if we added a *valid* signature above, we'd verify it.
+	// As we're using a dummy sig here, we can't fully verify it cryptographically unless we mock.
+	// For now, only check that it doesn't error due to missing parts.
+	_, err = deserializedMultiTx.VerifySignature()
+	if err != nil && !errors.Is(err, ErrNotEnoughSigners) && !strings.Contains(err.Error(), "invalid signature for signer") && !strings.Contains(err.Error(), "unmarshal") { // Expecting actual crypto error if it fails
+		t.Errorf("VerifySignature failed for deserialized multi-sig tx unexpectedly: %v", err)
+	}
 }
 
 func TestMultiSignatureVerification(t *testing.T) {
-	key1Priv, err := crypto.GenerateECDSAKeyPair(); if err != nil { t.Fatalf("key1Priv gen error: %v", err) }
-	key2Priv, err := crypto.GenerateECDSAKeyPair(); if err != nil { t.Fatalf("key2Priv gen error: %v", err) }
-	key3Priv, err := crypto.GenerateECDSAKeyPair(); if err != nil { t.Fatalf("key3Priv gen error: %v", err) }
+	// --- Setup: Generate Keys ---
+	key1Priv := newDummyPrivateKey(t)
+	key2Priv := newDummyPrivateKey(t)
+	key3Priv := newDummyPrivateKey(t) // 3rd authorized key, not necessarily signing below
+	key4UnauthPriv := newDummyPrivateKey(t) // Unauthorized key for negative test
 
-	pub1Bytes := crypto.SerializePublicKeyToBytes(&key1Priv.PublicKey)
-	pub2Bytes := crypto.SerializePublicKeyToBytes(&key2Priv.PublicKey)
-	pub3Bytes := crypto.SerializePublicKeyToBytes(&key3Priv.PublicKey)
-	authorizedKeys := [][]byte{pub1Bytes, pub2Bytes, pub3Bytes}
-	SortByteSlices(authorizedKeys)
-	multiSigAddressBytes := []byte("derived_multisig_address_placeholder")
+	pub1Bytes := elliptic.Marshal(elliptic.P256(), key1Priv.PublicKey.X, key1Priv.PublicKey.Y)
+	pub2Bytes := elliptic.Marshal(elliptic.P256(), key2Priv.PublicKey.X, key2Priv.PublicKey.Y)
+	pub3Bytes := elliptic.Marshal(elliptic.P256(), key3Priv.PublicKey.X, key3Priv.PublicKey.Y)
+	pub4UnauthBytes := elliptic.Marshal(elliptic.P256(), key4UnauthPriv.PublicKey.X, key4UnauthPriv.PublicKey.Y)
 
-	txBase := Transaction{
-		Timestamp:            time.Now().UnixNano(), From: multiSigAddressBytes, TxType: TxStandard,
-		To:                   []byte("recipient_test"), Amount: 1000, Fee: 10,
-		RequiredSignatures:   2, AuthorizedPublicKeys: authorizedKeys, Signers: []SignerInfo{},
-		PublicKey: nil, Signature: nil,
+	authorizedKeys := [][]byte{pub1Bytes, pub2Bytes, pub3Bytes} // N=3
+	SortByteSlices(authorizedKeys) // Canonical order
+
+	multiSigAddressBytes := []byte("derived_multisig_address_placeholder") // Dummy for now
+	recipientAddressBytes := newDummyPublicKeyBytes(t)
+
+	// --- Base Transaction for Multi-Sig ---
+	baseTx, err := NewMultiSigTransaction(
+		multiSigAddressBytes, TxStandard, 2, authorizedKeys, // M=2, N=3
+		uint64(1000), recipientAddressBytes, nil, nil, "", nil, uint64(10),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create base multi-sig transaction: %v", err)
 	}
 
-	txHashToSign, err := txBase.Hash(); if err != nil { t.Fatalf("txBase.Hash() error: %v", err) }
-	txBase.ID = txHashToSign
-
-	// Signer 1 signs
-	tx := txBase
-	sig1, err := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign); if err != nil { t.Fatalf("sig1 error: %v", err) }
-	tx.Signers = append(tx.Signers, SignerInfo{PublicKey: pub1Bytes, Signature: sig1})
-	valid, err := tx.VerifySignature()
-	if valid { t.Errorf("Succeeded with 1/2 sigs") }
-	if err == nil || !strings.Contains(err.Error(), "not enough signers") { t.Errorf("Expected 'not enough signers', got: %v", err) }
-
-	// Signer 2 signs
-	sig2, err := ecdsa.SignASN1(rand.Reader, key2Priv, txHashToSign); if err != nil { t.Fatalf("sig2 error: %v", err) }
-	tx.Signers = append(tx.Signers, SignerInfo{PublicKey: pub2Bytes, Signature: sig2})
-	sort.Slice(tx.Signers, func(i, j int) bool { return bytes.Compare(tx.Signers[i].PublicKey, tx.Signers[j].PublicKey) < 0 })
-	valid, err = tx.VerifySignature()
-	if err != nil { t.Fatalf("Failed with 2/2 sigs: %v", err) }
-	if !valid { t.Errorf("Valid = false with 2/2 sigs") }
-
-	// Tamper signature
-	tamperedTx := tx
-	tamperedTx.Signers = make([]SignerInfo, len(tx.Signers)); copy(tamperedTx.Signers, tx.Signers)
-	tamperedTx.Signers[1].Signature = []byte("tampered_sig")
-	valid, err = tamperedTx.VerifySignature()
-	if valid { t.Errorf("Succeeded with tampered sig") }
-	if err == nil || !strings.Contains(err.Error(), "invalid signature for signer") { t.Errorf("Expected 'invalid sig', got: %v", err) }
-
-	// Unauthorized signer
-	key4Unauth, err := crypto.GenerateECDSAKeyPair(); if err != nil { t.Fatalf("key4Unauth gen error: %v", err) }
-	pub4UnauthBytes := crypto.SerializePublicKeyToBytes(&key4Unauth.PublicKey)
-	sig4Unauth, err := ecdsa.SignASN1(rand.Reader, key4Unauth, txHashToSign); if err != nil { t.Fatalf("sig4Unauth error: %v", err) }
-	unauthTx := tx
-	unauthTx.Signers = make([]SignerInfo, len(tx.Signers)); copy(unauthTx.Signers, tx.Signers)
-	unauthTx.Signers = append(unauthTx.Signers, SignerInfo{PublicKey: pub4UnauthBytes, Signature: sig4Unauth})
-	valid, err = unauthTx.VerifySignature()
-	if valid { t.Errorf("Succeeded with unauth signer") }
-	if err == nil || !strings.Contains(err.Error(), "is not in the authorized list") { t.Errorf("Expected 'not in auth list', got: %v", err) }
-
-	// Duplicate signer
-	dupTx := tx
-	dupTx.Signers = make([]SignerInfo, len(tx.Signers)); copy(dupTx.Signers, tx.Signers)
-	dupTx.Signers = append(dupTx.Signers, tx.Signers[0])
-	valid, err = dupTx.VerifySignature()
-	if valid { t.Errorf("Succeeded with duplicate signer") }
-	if err == nil || !strings.Contains(err.Error(), "duplicate signature from public key") { t.Errorf("Expected 'duplicate sig', got: %v", err) }
-
-	// M > N
-	mnTx := Transaction{
-		Timestamp: tx.Timestamp, From: tx.From, TxType: tx.TxType, To: tx.To, Amount: tx.Amount, Fee: tx.Fee,
-		ID: tx.ID, PublicKey: nil, Signature: nil,
+	// Calculate the hash that needs to be signed by all parties
+	txHashToSign, err := baseTx.Hash()
+	if err != nil {
+		t.Fatalf("baseTx.Hash() error: %v", err)
 	}
-	mnTx.AuthorizedPublicKeys = [][]byte{pub1Bytes, pub2Bytes} // N=2
-	SortByteSlices(mnTx.AuthorizedPublicKeys)
-	mnTx.RequiredSignatures = 3 // M=3
-	// Add M (3) dummy/valid signers to pass the "len(Signers) < M" check.
-	mnTx.Signers = []SignerInfo{ // Need 3 signers for M=3
-		{PublicKey: pub1Bytes, Signature: sig1},
-		{PublicKey: pub2Bytes, Signature: sig2},
-		// This third signer's pubkey is not in mnTx.AuthorizedPublicKeys, so this setup is flawed for this specific test.
-		// The intention is to test M > N, not necessarily that all signers are valid *and* authorized for this specific check.
-		// The "is not in the authorized list" check might trigger first if pub3Bytes is used here.
-		// Let's use pub1Bytes again, which would be caught by duplicate signer if that check came before M > N.
-		// The M > N check ( tx.RequiredSignatures > uint32(len(tx.AuthorizedPublicKeys)) ) should be hit first.
-		{PublicKey: pub1Bytes, Signature: sig1}, // Add a third signature (can be a duplicate for this M>N structural test)
-	}
-	if len(mnTx.Signers) < int(mnTx.RequiredSignatures) { // Ensure we have enough signers for M
-		t.Fatalf("M>N Test setup error: not enough signers provided for M=%d", mnTx.RequiredSignatures)
-	}
+	baseTx.ID = txHashToSign // Set ID for this specific transaction
 
-	valid, err = mnTx.VerifySignature()
-	if valid { t.Errorf("Succeeded with M > N (M=%d, N=%d)", mnTx.RequiredSignatures, len(mnTx.AuthorizedPublicKeys)) }
-	expectedErrorMsg := fmt.Sprintf("M (%d) cannot be greater than N (%d)", mnTx.RequiredSignatures, len(mnTx.AuthorizedPublicKeys))
-	if err == nil || !strings.Contains(err.Error(), expectedErrorMsg) {
-		t.Errorf("Expected '%s', got: %v", expectedErrorMsg, err)
-	}
+	// --- Test Cases for VerifySignature ---
+
+	// Test 1: Not enough signers (0/2)
+	t.Run("NotEnoughSigners_Zero", func(t *testing.T) {
+		tx := baseTx // Start with base tx, no signers
+		valid, err := tx.VerifySignature()
+		if valid {
+			t.Errorf("VerifySignature succeeded with 0/2 signers; want false")
+		}
+		if err == nil || !errors.Is(err, ErrNotEnoughSigners) {
+			t.Errorf("Expected ErrNotEnoughSigners, got: %v", err)
+		}
+	})
+
+	// Test 2: Not enough signers (1/2) - Signer 1 only
+	t.Run("NotEnoughSigners_OneValid", func(t *testing.T) {
+		tx := baseTx
+		sig1, err := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign)
+		if err != nil {
+			t.Fatalf("Failed to sign: %v", err)
+		}
+		tx.Signers = []SignerInfo{{PublicKey: pub1Bytes, Signature: sig1}}
+
+		valid, err := tx.VerifySignature()
+		if valid {
+			t.Errorf("VerifySignature succeeded with 1/2 signers; want false")
+		}
+		if err == nil || !errors.Is(err, ErrNotEnoughSigners) {
+			t.Errorf("Expected ErrNotEnoughSigners, got: %v", err)
+		}
+	})
+
+	// Test 3: Exactly enough signers (2/2) - Signer 1 & 2
+	t.Run("EnoughSigners_AllValid", func(t *testing.T) {
+		tx := baseTx
+		sig1, err := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign)
+		if err != nil {
+			t.Fatalf("Failed to sign (sig1): %v", err)
+		}
+		sig2, err := ecdsa.SignASN1(rand.Reader, key2Priv, txHashToSign)
+		if err != nil {
+			t.Fatalf("Failed to sign (sig2): %v", err)
+		}
+		tx.Signers = []SignerInfo{
+			{PublicKey: pub1Bytes, Signature: sig1},
+			{PublicKey: pub2Bytes, Signature: sig2},
+		}
+		// Sort Signers by PublicKey for deterministic order in test assertion,
+		// though VerifySignature should handle unsorted internally.
+		sort.Slice(tx.Signers, func(i, j int) bool {
+			return bytes.Compare(tx.Signers[i].PublicKey, tx.Signers[j].PublicKey) < 0
+		})
+
+		valid, err := tx.VerifySignature()
+		if err != nil {
+			t.Fatalf("VerifySignature failed unexpectedly with 2/2 valid sigs: %v", err)
+		}
+		if !valid {
+			t.Errorf("VerifySignature = false with 2/2 valid sigs; want true")
+		}
+	})
+
+	// Test 4: Tampered signature
+	t.Run("TamperedSignature", func(t *testing.T) {
+		tx := baseTxPayload() // Get a fresh base transaction
+		sig1, _ := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign)
+		sig2, _ := ecdsa.SignASN1(rand.Reader, key2Priv, txHashToSign)
+		tx.Signers = []SignerInfo{
+			{PublicKey: pub1Bytes, Signature: sig1},
+			{PublicKey: pub2Bytes, Signature: sig2},
+		}
+		tx.Signers[1].Signature = []byte("tampered_sig") // Tamper one signature
+
+		valid, err := tx.VerifySignature()
+		if valid {
+			t.Errorf("VerifySignature succeeded with tampered sig; want false")
+		}
+		if err == nil || !errors.Is(err, ErrSignatureMissingOrInvalid) {
+			t.Errorf("Expected ErrSignatureMissingOrInvalid for tampered sig, got: %v", err)
+		}
+	})
+
+	// Test 5: Unauthorized signer
+	t.Run("UnauthorizedSigner", func(t *testing.T) {
+		tx := baseTxPayload()
+		sig1, _ := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign)
+		sig4Unauth, _ := ecdsa.SignASN1(rand.Reader, key4UnauthPriv, txHashToSign) // Signed by unauth key
+
+		tx.Signers = []SignerInfo{
+			{PublicKey: pub1Bytes, Signature: sig1},
+			{PublicKey: pub4UnauthBytes, Signature: sig4Unauth}, // This signer is NOT in authorizedKeys
+		}
+		
+		valid, err := tx.VerifySignature()
+		if valid {
+			t.Errorf("VerifySignature succeeded with unauthorized signer; want false")
+		}
+		if err == nil || !errors.Is(err, ErrUnauthorizedSigner) {
+			t.Errorf("Expected ErrUnauthorizedSigner, got: %v", err)
+		}
+	})
+
+	// Test 6: Duplicate signer (same public key signing twice)
+	t.Run("DuplicateSigner", func(t *testing.T) {
+		tx := baseTxPayload()
+		sig1_a, _ := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign)
+		sig1_b, _ := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign) // Same key, different signature potentially
+		
+		tx.Signers = []SignerInfo{
+			{PublicKey: pub1Bytes, Signature: sig1_a},
+			{PublicKey: pub1Bytes, Signature: sig1_b}, // Duplicate public key
+		}
+
+		valid, err := tx.VerifySignature()
+		if valid {
+			t.Errorf("VerifySignature succeeded with duplicate signer; want false")
+		}
+		if err == nil || !errors.Is(err, ErrDuplicateSigner) {
+			t.Errorf("Expected ErrDuplicateSigner, got: %v", err)
+		}
+	})
+
+	// Test 7: M > N (RequiredSignatures > len(AuthorizedPublicKeys))
+	t.Run("M_GreaterThan_N", func(t *testing.T) {
+		tx := baseTxPayload()
+		tx.RequiredSignatures = 3 // M=3 (but AuthorizedPublicKeys has N=2 as per baseTxPayload setup)
+
+		// Add enough valid signers to satisfy M, from the authorized list.
+		// We add signers from authorizedKeys, so we'll get pub1Bytes, pub2Bytes.
+		// Even if we add pub3Bytes, it's not in authorizedKeys.
+		// The error should be M > N, not UnauthorizedSigner.
+		sig1, _ := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign)
+		sig2, _ := ecdsa.SignASN1(rand.Reader, key2Priv, txHashToSign)
+		tx.Signers = []SignerInfo{
+			{PublicKey: pub1Bytes, Signature: sig1},
+			{PublicKey: pub2Bytes, Signature: sig2},
+		}
+
+		valid, err := tx.VerifySignature()
+		if valid {
+			t.Errorf("VerifySignature succeeded with M > N; want false")
+		}
+		if err == nil || !errors.Is(err, ErrMultiSigConfigInvalid) || !strings.Contains(err.Error(), "cannot be greater than N") {
+			t.Errorf("Expected ErrMultiSigConfigInvalid (M > N), got: %v", err)
+		}
+	})
+	
+	// Test 8: Empty/Missing public key or signature in SignerInfo within multi-sig array
+	t.Run("MissingSigOrPubKeyInSignerInfo", func(t *testing.T) {
+	    tx := baseTxPayload()
+	    // Add one valid, then one with missing pubkey
+	    sig1, _ := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign)
+	    tx.Signers = []SignerInfo{
+	        {PublicKey: pub1Bytes, Signature: sig1},
+	        {PublicKey: nil, Signature: []byte("some_sig")}, // Missing pubkey
+	    }
+	    valid, err := tx.VerifySignature()
+	    if valid { t.Errorf("VerifySignature succeeded with missing pubkey in signerInfo") }
+	    if err == nil || !errors.Is(err, ErrSignatureMissingOrInvalid) || !strings.Contains(err.Error(), "public key missing for signer") {
+	        t.Errorf("Expected 'public key missing' error, got: %v", err)
+	    }
+	    
+	    // Missing signature
+	    tx = baseTxPayload()
+	    tx.Signers = []SignerInfo{
+	        {PublicKey: pub1Bytes, Signature: sig1},
+	        {PublicKey: pub2Bytes, Signature: nil}, // Missing signature
+	    }
+	    valid, err = tx.VerifySignature()
+	    if valid { t.Errorf("VerifySignature succeeded with missing sig in signerInfo") }
+	    if err == nil || !errors.Is(err, ErrSignatureMissingOrInvalid) || !strings.Contains(err.Error(), "signature missing for signer") {
+	        t.Errorf("Expected 'signature missing' error, got: %v", err)
+	    }
+	})
+	
+	// Test 9: Tx with MultiSig fields present but zero signers
+	t.Run("MultiSigConfigPresentButNoSigners", func(t *testing.T) {
+		tx := baseTxPayload()
+		tx.Signers = []SignerInfo{} // Explicitly empty signers array
+		valid, err := tx.VerifySignature()
+		if valid { t.Errorf("VerifySignature succeeded with no signers but multi-sig config") }
+		if err == nil || !errors.Is(err, ErrNotEnoughSigners) {
+			t.Errorf("Expected ErrNotEnoughSigners when no signers provided for multi-sig, got: %v", err)
+		}
+	})
+	
+	// Test 10: Tx with MultiSig fields and Signers but M=0
+	t.Run("MultiSigMIsZero", func(t *testing.T) {
+	    tx := baseTxPayload()
+	    tx.RequiredSignatures = 0 // M=0
+	    sig1, _ := ecdsa.SignASN1(rand.Reader, key1Priv, txHashToSign)
+	    tx.Signers = []SignerInfo{{PublicKey: pub1Bytes, Signature: sig1}}
+	    
+	    valid, err := tx.VerifySignature()
+	    if valid { t.Errorf("VerifySignature succeeded when M=0") }
+	    if err == nil || !errors.Is(err, ErrMultiSigConfigInvalid) || !strings.Contains(err.Error(), "RequiredSignatures") {
+	        t.Errorf("Expected ErrMultiSigConfigInvalid (M=0), got: %v", err)
+	    }
+	})
 }

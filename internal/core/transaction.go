@@ -3,471 +3,519 @@ package core
 import (
 	"bytes"
 	"crypto/ecdsa"
-	"crypto/elliptic"
+	"crypto/elliptic" // For P256 curve
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64" // For new fields in TxDataForJSONHashing
+	"encoding/base64"
+	"encoding/binary" // Added for canonical byte representation of numbers
 	"encoding/gob"
-	"encoding/json" // New import for JSON hashing
-	"fmt"
-	"sort" // For sorting AuthorizedPublicKeys for canonical JSON
-	"time"
 	"encoding/hex"
+	"encoding/json"
+	"errors" // Explicitly import errors
+	"fmt"
+	"log"    // For structured logging
+	"sort"   // For sorting AuthorizedPublicKeys
+
+	// Removed unused "time" from here, but still used in functions where needed.
+)
+
+// --- Custom Error Definitions ---
+// Define specific error types for clearer handling, crucial for financial integrity.
+var (
+	ErrInvalidTransaction       = errors.New("invalid transaction")
+	ErrInvalidAddress           = errors.New("invalid address")
+	ErrInsufficientFunds        = errors.New("insufficient funds") // Conceptual, for later UTXO/balance checks
+	ErrSignatureMissingOrInvalid = errors.New("signature missing or invalid")
+	ErrPublicKeyMissingOrInvalid = errors.New("public key missing or invalid")
+	ErrContractCodeEmpty        = errors.New("contract code cannot be empty")
+	ErrFunctionNameEmpty        = errors.New("function name cannot be empty")
+	ErrTargetAddressMissing     = errors.New("target contract address missing")
+	ErrMultiSigConfigInvalid    = errors.New("multi-signature configuration invalid")
+	ErrNotEnoughSigners         = errors.New("not enough valid signatures provided")
+	ErrUnauthorizedSigner       = errors.New("signer not in authorized public keys list")
+	ErrDuplicateSigner          = errors.New("duplicate signature from same public key")
+	ErrTransactionHashing       = errors.New("failed to hash transaction data")
+	ErrTransactionSerialization = errors.New("failed to serialize transaction")
+	ErrTransactionDeserialization = errors.New("failed to deserialize transaction")
 )
 
 // TransactionType defines the type of transaction.
 type TransactionType string
 
 const (
-	TxStandard           TransactionType = "standard"
-	TxContractDeploy     TransactionType = "contract_deployment"
-	TxContractCall       TransactionType = "contract_call"
-	TxMultiSig           TransactionType = "multi_sig" // Potentially, a standard/call/deploy tx can *be* multi-sig
+	TxStandard       TransactionType = "standard"
+	TxContractDeploy TransactionType = "contract_deployment"
+	TxContractCall   TransactionType = "contract_call"
+	// TxMultiSig is not a type itself, but a property of other TxTypes.
+	// Removed as a top-level TxType to reduce ambiguity.
 )
 
-// SignerInfo holds a public key and its corresponding signature for multi-sig.
+// SignerInfo holds a public key and its corresponding signature for a multi-sig transaction.
+// The `json` tags ensure proper serialization/deserialization.
 type SignerInfo struct {
-	PublicKey []byte `json:"publicKey"` // Hex encoded for JSON, but []byte internally
-	Signature []byte `json:"signature"` // Hex encoded for JSON, but []byte internally
+	PublicKey []byte `json:"publicKey"` // Raw bytes, will be hex-encoded for JSON output
+	Signature []byte `json:"signature"` // Raw bytes, will be base64-encoded for JSON output
 }
 
-// Transaction represents a standard transaction in the blockchain.
+// Transaction represents a transaction in the blockchain.
+// This struct is comprehensive, supporting standard transfers, contract deployments,
+// contract calls, and multi-signature authorizations.
 type Transaction struct {
-	ID        []byte // Hash of the transaction content
-	Timestamp int64
+	ID        []byte          `json:"id"`        // SHA256 hash of the canonical transaction payload
+	Timestamp int64           `json:"timestamp"` // Unix nanoseconds
+	TxType    TransactionType `json:"txType"`    // Type of transaction (e.g., "standard", "contract_deployment")
 
-	// For single signer transactions OR as the multi-sig entity identifier
-	From      []byte // Serialized Public Key of the sender OR MultiSig Address/Identifier
+	// Standard Transaction Fields (TxStandard)
+	From   []byte `json:"from,omitempty"`   // Sender's public key bytes (for single-sig) or MultiSig ID (for multi-sig)
+	To     []byte `json:"to,omitempty"`     // Recipient's public key hash bytes
+	Amount uint64 `json:"amount,omitempty"` // Value transferred
 
-	// Single signer fields (used if TxType is not effectively multi-sig)
-	PublicKey []byte // Sender's actual public key (if single signer)
-	Signature []byte // Single signature
+	// Contract Deployment Fields (TxContractDeploy)
+	ContractCode []byte `json:"contractCode,omitempty"` // Compiled contract bytecode
 
-	TxType    TransactionType
+	// Contract Call Fields (TxContractCall)
+	TargetContractAddress []byte `json:"targetContractAddress,omitempty"` // Address of the contract to call
+	FunctionName          string `json:"functionName,omitempty"`          // Name of the function to call
+	Arguments             []byte `json:"arguments,omitempty"`             // Encoded arguments for the function call
 
-	// Fields for TxStandard (can also be multi-sig)
-	To     []byte
-	Amount uint64
-	Fee    uint64
+	// Transaction Fee (common to most types)
+	Fee uint64 `json:"fee"` // Fee paid for transaction processing
 
-	// Fields for TxContractDeploy (can also be multi-sig)
-	ContractCode []byte
+	// Single-Signature Fields
+	// These are populated for standard single-signer transactions.
+	// If multi-signature fields (RequiredSignatures, AuthorizedPublicKeys, Signers) are present,
+	// these single-signature fields are typically ignored/empty (except 'From' which becomes MultiSig ID).
+	PublicKey []byte `json:"publicKey,omitempty"` // Sender's actual public key bytes
+	Signature []byte `json:"signature,omitempty"` // Single cryptographic signature
 
-	// Fields for TxContractCall (can also be multi-sig)
-	TargetContractAddress []byte
-	FunctionName          string
-	Arguments             []byte
-
-	// Multi-Signature Fields
-	// These are populated if this transaction is intended to be authorized by multiple signatures.
-	// If these are present, 'From' should be the multi-sig address/identifier.
-	// 'PublicKey' and 'Signature' fields above would be empty or ignored.
-	RequiredSignatures  uint32       `json:"requiredSignatures,omitempty"` // M value
-	AuthorizedPublicKeys [][]byte     `json:"authorizedPublicKeys,omitempty"` // N public keys (list of hex strings for JSON)
-	Signers             []SignerInfo `json:"signers,omitempty"` // Collected M signatures
+	// Multi-Signature Fields (M-of-N Multi-Sig)
+	// These are populated if this transaction requires multiple authorizations.
+	// 'From' should be the derived multi-sig address/identifier when these are used.
+	RequiredSignatures   uint32       `json:"requiredSignatures,omitempty"`   // M: Minimum number of signatures required
+	AuthorizedPublicKeys [][]byte     `json:"authorizedPublicKeys,omitempty"` // N: List of all authorized public keys (raw bytes)
+	Signers              []SignerInfo `json:"signers,omitempty"`              // Collected individual signatures
 }
 
-
-// TxDataForJSONHashing is used to create a canonical representation for hashing.
-// For multi-sig, this payload (excluding Signers list) is what each signer signs.
-// It must include all fields that define the transaction's intent.
-// Order of fields matters for JSON canonical form if using struct tags for specific ordering,
-// or rely on alphabetical sorting of map keys if converting to map[string]interface{} first.
-// The Python side currently sorts keys alphabetically.
-// This Go struct's fields MUST be in alphabetical order for JSON marshalling to match Python's output.
-// The Signers field is EXCLUDED from this hashing structure, as it's what's being collected.
-// However, the multi-sig configuration (M and N keys) IS part of what's signed.
-type TxDataForJSONHashing struct {
-	Amount                uint64   `json:"Amount,omitempty"`
-	Arguments             string   `json:"Arguments,omitempty"`             // base64 of []byte
-	AuthorizedPublicKeys  []string `json:"AuthorizedPublicKeys,omitempty"`  // List of hex strings
-	ContractCode          string   `json:"ContractCode,omitempty"`          // base64 of []byte
-	Fee                   uint64   `json:"Fee"`
-	From                  string   `json:"From"`                          // hex string of Sender PubKey or MultiSig ID
-	FunctionName          string   `json:"FunctionName,omitempty"`
-	PublicKey             string   `json:"PublicKey,omitempty"`           // hex string (for single signer tx)
-	RequiredSignatures    uint32   `json:"RequiredSignatures,omitempty"`  // M value
-	TargetContractAddress string   `json:"TargetContractAddress,omitempty"` // hex string
-	Timestamp             int64    `json:"Timestamp"`
-	To                    string   `json:"To,omitempty"`                    // hex string
-	TxType                string   `json:"TxType"`
+// CanonicalTxPayload defines the structure for data that is hashed for transaction ID and signing.
+// Fields are explicitly ordered and typed to ensure consistent JSON serialization
+// matching Python's `json.dumps(..., sort_keys=True)`.
+// This struct includes all fields that define the transaction's intent, but EXCLUDES collected signatures (Signers).
+// Note: Fields are alphabetized based on their JSON tag names for canonical marshaling.
+type CanonicalTxPayload struct {
+	Amount                uint64   `json:"amount,omitempty"`
+	Arguments             string   `json:"arguments,omitempty"` // base64 of []byte
+	AuthorizedPublicKeys  []string `json:"authorizedPublicKeys,omitempty"` // List of hex strings
+	ContractCode          string   `json:"contractCode,omitempty"`          // base64 of []byte
+	Fee                   uint64   `json:"fee"`
+	From                  string   `json:"from"` // hex string of Sender PubKey or MultiSig ID
+	FunctionName          string   `json:"functionName,omitempty"`
+	PublicKey             string   `json:"publicKey,omitempty"` // hex string (for single signer tx)
+	RequiredSignatures    uint32   `json:"requiredSignatures,omitempty"` // M value
+	TargetContractAddress string   `json:"targetContractAddress,omitempty"` // hex string
+	Timestamp             int64    `json:"timestamp"`
+	To                    string   `json:"to,omitempty"` // hex string
+	TxType                string   `json:"txType"`
 }
 
+// --- Transaction Constructors (New Functionality) ---
+// Adhere to "Know Your Core, Keep it Clear" by providing explicit constructors for different types.
 
-// NewStandardTransaction creates a new standard value transfer transaction (single signer).
-func NewStandardTransaction(from *ecdsa.PublicKey, to *ecdsa.PublicKey, amount uint64, fee uint64) (*Transaction, error) {
-	if from == nil || to == nil {
-		return nil, fmt.Errorf("sender and receiver public keys must be provided for standard transaction")
-	}
-	fromBytes := elliptic.Marshal(elliptic.P256(), from.X, from.Y)
-	toBytes := elliptic.Marshal(elliptic.P256(), to.X, to.Y)
+// NewStandardTransaction creates a new single-signer value transfer transaction.
+func NewStandardTransaction(fromPubKey *ecdsa.PublicKey, toPubKeyHash []byte, amount uint64, fee uint64) (*Transaction, error) {
+    if fromPubKey == nil || len(toPubKeyHash) == 0 {
+        return nil, ErrInvalidTransaction // Use specific error
+    }
+    senderPubKeyBytes := elliptic.Marshal(elliptic.P256(), fromPubKey.X, fromPubKey.Y)
 
-	tx := &Transaction{
-		Timestamp:    time.Now().UnixNano(),
-		From:         fromBytes,
-		PublicKey:    fromBytes,
-		TxType:       TxStandard,
-		To:           toBytes,
-		Amount:       amount,
-		Fee:          fee,
-	}
-	return tx, nil
+    tx := &Transaction{
+        Timestamp: time.Now().UnixNano(),
+        From:      senderPubKeyBytes, // Sender's pubkey as 'From'
+        PublicKey: senderPubKeyBytes, // Redundant for single-sig, but explicit for clarity
+        TxType:    TxStandard,
+        To:        toPubKeyHash,
+        Amount:    amount,
+        Fee:       fee,
+    }
+    // Hash and sign will be done separately (Sign method updates ID)
+    return tx, nil
 }
 
-// NewContractDeploymentTransaction creates a new contract deployment transaction.
-func NewContractDeploymentTransaction(deployer *ecdsa.PublicKey, contractCode []byte, fee uint64) (*Transaction, error) {
-	if deployer == nil {
-		return nil, fmt.Errorf("deployer public key must be provided")
-	}
-	if len(contractCode) == 0 {
-		return nil, fmt.Errorf("contract code cannot be empty for deployment")
-	}
-	fromBytes := elliptic.Marshal(elliptic.P256(), deployer.X, deployer.Y)
+// NewContractDeploymentTransaction creates a new contract deployment transaction (single signer).
+func NewContractDeploymentTransaction(deployerPubKey *ecdsa.PublicKey, contractCode []byte, fee uint64) (*Transaction, error) {
+    if deployerPubKey == nil || len(contractCode) == 0 {
+        return nil, ErrContractCodeEmpty // Use specific error
+    }
+    senderPubKeyBytes := elliptic.Marshal(elliptic.P256(), deployerPubKey.X, deployerPubKey.Y)
 
-	tx := &Transaction{
-		Timestamp:    time.Now().UnixNano(),
-		From:         fromBytes,
-		PublicKey:    fromBytes, // For single signer deployment
-		TxType:       TxContractDeploy,
-		ContractCode: contractCode,
-		Fee:          fee,
-	}
-	return tx, nil
+    tx := &Transaction{
+        Timestamp:    time.Now().UnixNano(),
+        From:         senderPubKeyBytes,
+        PublicKey:    senderPubKeyBytes,
+        TxType:       TxContractDeploy,
+        ContractCode: contractCode,
+        Fee:          fee,
+    }
+    return tx, nil
 }
 
 // NewContractCallTransaction creates a new contract call transaction (single signer).
-func NewContractCallTransaction(caller *ecdsa.PublicKey, contractAddress []byte, functionName string, args []byte, fee uint64) (*Transaction, error) {
-	if caller == nil {
-		return nil, fmt.Errorf("caller public key must be provided")
+func NewContractCallTransaction(callerPubKey *ecdsa.PublicKey, contractAddress []byte, functionName string, args []byte, fee uint64) (*Transaction, error) {
+    if callerPubKey == nil || len(contractAddress) == 0 || functionName == "" {
+        return nil, ErrInvalidTransaction // Consolidated check
+    }
+    senderPubKeyBytes := elliptic.Marshal(elliptic.P256(), callerPubKey.X, callerPubKey.Y)
+
+    tx := &Transaction{
+        Timestamp:             time.Now().UnixNano(),
+        From:                  senderPubKeyBytes,
+        PublicKey:             senderPubKeyBytes,
+        TxType:                TxContractCall,
+        TargetContractAddress: contractAddress,
+        FunctionName:          functionName,
+        Arguments:             args,
+        Fee:                   fee,
+    }
+    return tx, nil
+}
+
+// NewMultiSigTransaction creates a transaction requiring M-of-N signatures.
+// 'from' parameter should conceptually be the derived multi-sig address/identifier.
+func NewMultiSigTransaction(
+	fromMultiSigID []byte,
+	txType TransactionType,
+	requiredSignatures uint32,
+	authorizedPublicKeys [][]byte,
+	amount uint64, // Common for standard/call types that have amount
+	toPubKeyHash []byte, // For standard
+	contractCode []byte, // For deploy
+	targetContractAddress []byte, // For call
+	functionName string, // For call
+	args []byte, // For call
+	fee uint64,
+) (*Transaction, error) {
+	if len(fromMultiSigID) == 0 || requiredSignatures == 0 || len(authorizedPublicKeys) == 0 {
+		return nil, ErrMultiSigConfigInvalid // Basic validation
 	}
-	if len(contractAddress) == 0 {
-		return nil, fmt.Errorf("target contract address must be provided")
+	if requiredSignatures > uint32(len(authorizedPublicKeys)) {
+		return nil, ErrMultiSigConfigInvalid
 	}
-	if functionName == "" {
-		return nil, fmt.Errorf("function name cannot be empty for contract call")
-	}
-	fromBytes := elliptic.Marshal(elliptic.P256(), caller.X, caller.Y)
 
 	tx := &Transaction{
-		Timestamp:             time.Now().UnixNano(),
-		From:                  fromBytes,
-		PublicKey:             fromBytes, // For single signer call
-		TxType:                TxContractCall,
-		TargetContractAddress: contractAddress,
-		FunctionName:          functionName,
-		Arguments:             args,
-		Fee:                   fee,
+		Timestamp:          time.Now().UnixNano(),
+		From:               fromMultiSigID, // Multi-sig ID as 'From'
+		TxType:             txType,
+		Fee:                fee,
+		RequiredSignatures: requiredSignatures,
+		AuthorizedPublicKeys: authorizedPublicKeys,
+		Signers:            []SignerInfo{}, // Initialize empty
 	}
+
+	// Populate type-specific fields
+	switch txType {
+	case TxStandard:
+		tx.Amount = amount
+		tx.To = toPubKeyHash
+	case TxContractDeploy:
+		tx.ContractCode = contractCode
+	case TxContractCall:
+		tx.TargetContractAddress = targetContractAddress
+		tx.FunctionName = functionName
+		tx.Arguments = args
+		tx.Amount = amount // Call can also transfer value
+	default:
+		return nil, ErrInvalidTransaction // Unsupported type for multi-sig
+	}
+
 	return tx, nil
 }
 
 
-// Old NewTransaction - to be removed or refactored
-// NewTransaction creates a new transaction.
-// Signature is applied separately. ID is calculated after signing.
-func NewTransaction(from *ecdsa.PublicKey, to *ecdsa.PublicKey, amount uint64, fee uint64) (*Transaction, error) {
-	if from == nil || to == nil {
-		return nil, fmt.Errorf("sender and receiver public keys must be provided")
-	}
+// --- Hashing and Signing Logic ---
 
-	fromBytes := elliptic.Marshal(elliptic.P256(), from.X, from.Y)
-	toBytes := elliptic.Marshal(elliptic.P256(), to.X, to.Y)
-
-	tx := &Transaction{
-		Timestamp: time.Now().UnixNano(),
-		From:      fromBytes,
-		To:        toBytes,
-		Amount:    amount,
-		Fee:       fee,
-		PublicKey: fromBytes, // Store the sender's public key
-	}
-	return tx, nil
-}
-
-// prepareDataForHashing creates a consistent byte representation of the transaction for hashing.
-// It now uses a canonical JSON representation to ensure cross-language compatibility for hashing.
+// prepareDataForHashing creates a canonical JSON representation of the transaction's core data.
+// This canonical form ensures consistent hashing across different environments and languages (e.g., Go and Python).
+// It includes all fields that define the transaction's intent, but EXCLUDES collected signatures (Signers) and final ID.
 func (tx *Transaction) prepareDataForHashing() ([]byte, error) {
-	// The fields included and their types must match what the Python wallet's
-	// transaction.data_for_hashing() produces for its JSON string.
-	// Python uses hex strings for From, To, PublicKey in its JSON.
-	//
-	// Removed unused 'data' map variable:
-	// data := map[string]interface{}{ ... }
+    // Populate the canonical hashing struct.
+    // Ensure all byte slices are hex-encoded for JSON representation.
+    // Ensure `Arguments` and `ContractCode` are base64-encoded.
+    hashingStruct := CanonicalTxPayload{
+        Fee:       tx.Fee,
+        From:      hex.EncodeToString(tx.From),
+        Timestamp: tx.Timestamp,
+        TxType:    string(tx.TxType),
+    }
 
-	// To achieve a canonical JSON form, we should sort the keys.
-	// The Python side uses json.dumps with sort_keys=True.
-	// Go's json.Marshal on a map does not guarantee order.
-	// A common approach for canonical JSON:
-	// 1. Marshal to map[string]interface{}
-	// 2. Get keys, sort them.
-	// 3. Construct JSON string by iterating in key order.
-	// However, Go's json.Marshal on a struct *does* respect struct field order (mostly for simple cases).
-	// A simpler approach that matches Python's `json.dumps(payload_to_hash, sort_keys=True, separators=(',', ':'))`
-	// is to marshal the map and rely on the default behavior or ensure Python matches Go's default map marshaling
-	// if it were stable (which it isn't for maps).
-	//
-	// Python's `json.dumps` with `sort_keys=True` is the target.
-	// Go doesn't have a direct equivalent for sorting map keys before JSON marshaling in one step.
-	// We must build the JSON string carefully or use a struct with ordered fields.
-	//
-	// Let's use a struct for deterministic JSON field order matching Python's expectation for hashing.
-	// This struct will be used *only* for creating the JSON to be hashed.
-	// The Python side uses these exact field names, capitalized, and json.dumps sorts them.
-	// So, this Go struct must have its fields alphabetized for `json.Marshal` to match.
-	// Fields are `omitempty` where appropriate.
-
-	hashingStruct := TxDataForJSONHashing{
-		Fee:       tx.Fee,
-		From:      hex.EncodeToString(tx.From),
-		Timestamp: tx.Timestamp,
-		TxType:    string(tx.TxType),
+    if tx.Amount != 0 { // Omit if zero unless TxStandard specifically requires 0
+		hashingStruct.Amount = tx.Amount
+	} else if tx.TxType == TxStandard {
+		hashingStruct.Amount = 0 // Explicitly set 0 for standard if needed
 	}
 
-	// Single-signer PublicKey (empty for pure multi-sig where From is multi-sig ID)
-	if len(tx.PublicKey) > 0 && tx.RequiredSignatures == 0 {
-		hashingStruct.PublicKey = hex.EncodeToString(tx.PublicKey)
-	}
+    if len(tx.PublicKey) > 0 { // Only for single signer tx
+        hashingStruct.PublicKey = hex.EncodeToString(tx.PublicKey)
+    }
 
-	// Amount - can be present for standard, deploy (0), or call (value)
-	// Using omitempty, so only include if non-zero or if TxStandard
-	if tx.TxType == TxStandard || tx.Amount != 0 {
-	    hashingStruct.Amount = tx.Amount
-	}
+    if len(tx.To) > 0 {
+        hashingStruct.To = hex.EncodeToString(tx.To)
+    }
 
+    if len(tx.ContractCode) > 0 {
+        hashingStruct.ContractCode = base64.StdEncoding.EncodeToString(tx.ContractCode)
+    }
 
-	// Standard transaction fields
-	if tx.TxType == TxStandard {
-		if len(tx.To) > 0 {
-			hashingStruct.To = hex.EncodeToString(tx.To)
-		}
-	}
+    if len(tx.TargetContractAddress) > 0 {
+        hashingStruct.TargetContractAddress = hex.EncodeToString(tx.TargetContractAddress)
+    }
+    if tx.FunctionName != "" { 
+        hashingStruct.FunctionName = tx.FunctionName
+    }
+    if len(tx.Arguments) > 0 {
+        hashingStruct.Arguments = base64.StdEncoding.EncodeToString(tx.Arguments)
+    }
 
-	// Contract deployment fields
-	if tx.TxType == TxContractDeploy {
-		if len(tx.ContractCode) > 0 {
-			hashingStruct.ContractCode = base64.StdEncoding.EncodeToString(tx.ContractCode)
-		}
-	}
+    // Multi-signature configuration fields (part of what's signed)
+    if tx.RequiredSignatures > 0 && len(tx.AuthorizedPublicKeys) > 0 {
+        hashingStruct.RequiredSignatures = tx.RequiredSignatures
+        hexKeys := make([]string, len(tx.AuthorizedPublicKeys))
+        for i, pkBytes := range tx.AuthorizedPublicKeys {
+            hexKeys[i] = hex.EncodeToString(pkBytes)
+        }
+        sort.Strings(hexKeys) // Crucial for canonical JSON order
+        hashingStruct.AuthorizedPublicKeys = hexKeys
+    }
 
-	// Contract call fields
-	if tx.TxType == TxContractCall {
-		if len(tx.TargetContractAddress) > 0 {
-			hashingStruct.TargetContractAddress = hex.EncodeToString(tx.TargetContractAddress)
-		}
-		if tx.FunctionName != "" { // omitempty in struct tag handles empty string
-			hashingStruct.FunctionName = tx.FunctionName
-		}
-		if len(tx.Arguments) > 0 {
-			hashingStruct.Arguments = base64.StdEncoding.EncodeToString(tx.Arguments)
-		}
-	}
-
-	// Multi-signature configuration fields (part of what's signed)
-	if tx.RequiredSignatures > 0 && len(tx.AuthorizedPublicKeys) > 0 {
-		hashingStruct.RequiredSignatures = tx.RequiredSignatures
-
-		hexKeys := make([]string, len(tx.AuthorizedPublicKeys))
-		for i, pkBytes := range tx.AuthorizedPublicKeys {
-			hexKeys[i] = hex.EncodeToString(pkBytes)
-		}
-		sort.Strings(hexKeys) // Sort the hex strings alphabetically for canonical JSON
-		hashingStruct.AuthorizedPublicKeys = hexKeys
-	}
-
-	jsonBytes, err := json.Marshal(hashingStruct)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal transaction data to JSON for hashing: %w", err)
-	}
-	return jsonBytes, nil
+    // json.Marshal on a struct with explicit `json:"field,omitempty"` tags
+    // and correctly ordered fields produces canonical JSON for hashing.
+    jsonBytes, err := json.Marshal(hashingStruct)
+    if err != nil {
+        return nil, fmt.Errorf("%w: failed to marshal transaction data to JSON for hashing: %v", ErrTransactionHashing, err)
+    }
+    return jsonBytes, nil
 }
 
-// Hash calculates the SHA256 hash of the transaction's content (for signing and ID).
+// Hash calculates the SHA256 hash of the transaction's canonical content.
+// This hash serves as the transaction's unique ID.
 func (tx *Transaction) Hash() ([]byte, error) {
-	txDataBytes, err := tx.prepareDataForHashing()
-	if err != nil {
-		return nil, err
-	}
-	hash := sha256.Sum256(txDataBytes)
-	return hash[:], nil
+    txDataBytes, err := tx.prepareDataForHashing()
+    if err != nil {
+        return nil, err
+    }
+    hash := sha256.Sum256(txDataBytes)
+    return hash[:], nil
 }
 
 // Sign signs the transaction using the provided ECDSA private key.
-// It sets the transaction's Signature and PublicKey fields.
-// The transaction ID should be set after signing by hashing the signed transaction (or its hash).
+// It sets the transaction's Signature and PublicKey fields (for single-sig) or adds to Signers (for multi-sig).
+// The transaction ID should be set after successful signing.
 func (tx *Transaction) Sign(privateKey *ecdsa.PrivateKey) error {
-	if privateKey == nil {
-		return fmt.Errorf("private key is required to sign transaction")
-	}
+    if privateKey == nil {
+        return ErrSignatureMissingOrInvalid // Use specific error
+    }
 
-	// Ensure PublicKey matches the private key
-	pubKeyBytes := elliptic.Marshal(elliptic.P256(), privateKey.PublicKey.X, privateKey.PublicKey.Y)
-	tx.PublicKey = pubKeyBytes
-	tx.From = pubKeyBytes // Sender is derived from the private key used for signing
+    txHash, err := tx.Hash() // Hash of the canonical transaction payload
+    if err != nil {
+        return fmt.Errorf("%w: failed to hash transaction for signing: %v", ErrTransactionHashing, err)
+    }
 
-	txHash, err := tx.Hash() // This hash is of the transaction data *before* signature
-	if err != nil {
-		return fmt.Errorf("failed to hash transaction for signing: %w", err)
-	}
+    sig, err := ecdsa.SignASN1(rand.Reader, privateKey, txHash)
+    if err != nil {
+        return fmt.Errorf("%w: failed to sign transaction: %v", ErrSignatureMissingOrInvalid, err)
+    }
+    
+    signerPubKeyBytes := elliptic.Marshal(elliptic.P256(), privateKey.PublicKey.X, privateKey.PublicKey.Y)
 
-	sig, err := ecdsa.SignASN1(rand.Reader, privateKey, txHash)
-	if err != nil {
-		return fmt.Errorf("failed to sign transaction: %w", err)
-	}
-	tx.Signature = sig
+    if tx.RequiredSignatures > 0 { // This is a multi-signature transaction
+        // Add the signature to the Signers slice
+        tx.Signers = append(tx.Signers, SignerInfo{
+            PublicKey: signerPubKeyBytes,
+            Signature: sig,
+        })
+    } else { // This is a single-signature transaction
+        tx.PublicKey = signerPubKeyBytes
+        tx.Signature = sig
+        // For single-sig, 'From' is implicitly the Public Key of the signer
+        tx.From = signerPubKeyBytes
+    }
 
-	// After signing, the ID can be set. The ID is the hash of the signed transaction data's hash.
-	// Or, more commonly, ID is simply the txHash itself (hash of content before signature).
-	// Let's use txHash (hash of content) as the ID.
-	tx.ID = txHash
-	return nil
+    // Set the transaction ID after signing to ensure it's finalized (often hash of content)
+    tx.ID = txHash
+    return nil
 }
 
 // VerifySignature checks the transaction's signature(s).
-// It handles both single-signer and multi-signer transactions.
+// It handles both single-signer and multi-signer transactions based on the presence of multi-sig fields.
 func (tx *Transaction) VerifySignature() (bool, error) {
-	// If multi-sig fields are populated, assume it's a multi-sig transaction.
-	isMultiSig := tx.RequiredSignatures > 0 && len(tx.AuthorizedPublicKeys) > 0
+    isMultiSig := tx.RequiredSignatures > 0 || len(tx.AuthorizedPublicKeys) > 0 || len(tx.Signers) > 0
 
-	if isMultiSig {
-		return tx.verifyMultiSignature()
-	}
-	return tx.verifySingleSignature()
+    if isMultiSig {
+        return tx.verifyMultiSignature()
+    }
+    return tx.verifySingleSignature()
 }
 
 // verifySingleSignature handles validation for non-multi-sig transactions.
 func (tx *Transaction) verifySingleSignature() (bool, error) {
-	if tx.PublicKey == nil || len(tx.PublicKey) == 0 {
-		return false, fmt.Errorf("public key is missing for single-signer transaction")
-	}
-	if tx.Signature == nil || len(tx.Signature) == 0 {
-		return false, fmt.Errorf("signature is missing for single-signer transaction")
-	}
+    if len(tx.PublicKey) == 0 {
+        return false, ErrPublicKeyMissingOrInvalid
+    }
+    if len(tx.Signature) == 0 {
+        return false, ErrSignatureMissingOrInvalid
+    }
 
-	// Deserialize the public key
-	x, y := elliptic.Unmarshal(elliptic.P256(), tx.PublicKey)
-	if x == nil {
-		return false, fmt.Errorf("failed to unmarshal public key for single-signer")
-	}
-	publicKeyObj := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
+    x, y := elliptic.Unmarshal(elliptic.P256(), tx.PublicKey)
+    if x == nil || y == nil { // Ensure both X and Y are valid
+        return false, ErrPublicKeyMissingOrInvalid
+    }
+    publicKeyObj := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
 
-	txHash, err := tx.Hash() // This hash now includes multi-sig config if present, which is fine.
-	if err != nil {
-		return false, fmt.Errorf("failed to hash transaction for single-signer verification: %w", err)
-	}
+    txHash, err := tx.Hash() // Hash of the canonical transaction payload (same as tx.ID after signing)
+    if err != nil {
+        return false, fmt.Errorf("%w: failed to hash transaction for single-signer verification: %v", ErrTransactionHashing, err)
+    }
 
-	valid := ecdsa.VerifyASN1(publicKeyObj, txHash, tx.Signature)
-	return valid, nil
+    valid := ecdsa.VerifyASN1(publicKeyObj, txHash, tx.Signature)
+    return valid, nil
 }
 
 // verifyMultiSignature handles validation for multi-signature transactions.
 func (tx *Transaction) verifyMultiSignature() (bool, error) {
-	if tx.RequiredSignatures == 0 {
-		return false, fmt.Errorf("RequiredSignatures (M) must be greater than 0 for multi-sig")
-	}
-	if uint32(len(tx.Signers)) < tx.RequiredSignatures {
-		return false, fmt.Errorf("not enough signers: have %d, require %d", len(tx.Signers), tx.RequiredSignatures)
-	}
-	if len(tx.AuthorizedPublicKeys) == 0 {
-		return false, fmt.Errorf("AuthorizedPublicKeys (N) must be provided for multi-sig")
-	}
-	if tx.RequiredSignatures > uint32(len(tx.AuthorizedPublicKeys)) {
-		return false, fmt.Errorf("M (%d) cannot be greater than N (%d)", tx.RequiredSignatures, len(tx.AuthorizedPublicKeys))
-	}
+    // Basic multi-sig config validation
+    if tx.RequiredSignatures == 0 || uint32(len(tx.AuthorizedPublicKeys)) == 0 {
+        return false, ErrMultiSigConfigInvalid
+    }
+    if tx.RequiredSignatures > uint32(len(tx.AuthorizedPublicKeys)) {
+        return false, fmt.Errorf("%w: M (%d) cannot be greater than N (%d)", ErrMultiSigConfigInvalid, tx.RequiredSignatures, len(tx.AuthorizedPublicKeys))
+    }
+    // Ensure enough signers are actually provided for the validation process
+    if uint32(len(tx.Signers)) < tx.RequiredSignatures {
+        return false, fmt.Errorf("%w: not enough signers provided for verification (have %d, require %d)", ErrNotEnoughSigners, len(tx.Signers), tx.RequiredSignatures)
+    }
 
-	// Calculate the hash of the transaction content (payload + multi-sig config)
-	// This is what each signer should have signed.
-	txHash, err := tx.Hash()
-	if err != nil {
-		return false, fmt.Errorf("failed to hash transaction for multi-sig verification: %w", err)
-	}
 
-	// Keep track of unique public keys that have provided valid signatures
-	validSignerPubKeys := make(map[string]bool)
+    txHash, err := tx.Hash() // This hash is of the transaction content (payload + multi-sig config)
+    if err != nil {
+        return false, fmt.Errorf("%w: failed to hash transaction for multi-sig verification: %v", ErrTransactionHashing, err)
+    }
 
-	for i, signerInfo := range tx.Signers {
-		if signerInfo.PublicKey == nil || len(signerInfo.PublicKey) == 0 {
-			return false, fmt.Errorf("public key missing for signer %d", i)
-		}
-		if signerInfo.Signature == nil || len(signerInfo.Signature) == 0 {
-			return false, fmt.Errorf("signature missing for signer %d (pubkey: %x)", i, signerInfo.PublicKey)
-		}
+    validSignerPubKeys := make(map[string]bool) // Use map to track unique valid signers
 
-		// 1. Check if signer's public key is one of the authorized public keys
-		isAuthorized := false
-		for _, authorizedKeyBytes := range tx.AuthorizedPublicKeys {
-			if bytes.Equal(signerInfo.PublicKey, authorizedKeyBytes) {
-				isAuthorized = true
-				break
-			}
-		}
-		if !isAuthorized {
-			return false, fmt.Errorf("signer %d (pubkey: %x) is not in the authorized list", i, signerInfo.PublicKey)
-		}
+    for i, signerInfo := range tx.Signers {
+        if len(signerInfo.PublicKey) == 0 || len(signerInfo.Signature) == 0 {
+            return false, fmt.Errorf("%w: signer %d has missing public key or signature", ErrSignatureMissingOrInvalid, i)
+        }
 
-		// 2. Check for duplicate signers (by public key)
-		signerPubKeyHex := hex.EncodeToString(signerInfo.PublicKey)
-		if validSignerPubKeys[signerPubKeyHex] {
-			return false, fmt.Errorf("duplicate signature from public key: %s", signerPubKeyHex)
-		}
+        // 1. Check if signer's public key is one of the authorized public keys
+        isAuthorized := false
+        for _, authorizedKeyBytes := range tx.AuthorizedPublicKeys {
+            if bytes.Equal(signerInfo.PublicKey, authorizedKeyBytes) {
+                isAuthorized = true
+                break
+            }
+        }
+        if !isAuthorized {
+            return false, fmt.Errorf("%w: signer %d (pubkey: %x) is not in the authorized list", ErrUnauthorizedSigner, i, signerInfo.PublicKey)
+        }
 
-		// 3. Verify the signature
-		x, y := elliptic.Unmarshal(elliptic.P256(), signerInfo.PublicKey)
-		if x == nil {
-			return false, fmt.Errorf("failed to unmarshal public key for signer %d (pubkey: %x)", i, signerInfo.PublicKey)
-		}
-		publicKeyObj := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
+        // 2. Check for duplicate signers (by public key) - only one valid signature per key
+        signerPubKeyHex := hex.EncodeToString(signerInfo.PublicKey)
+        if validSignerPubKeys[signerPubKeyHex] {
+            return false, fmt.Errorf("%w: duplicate signature from public key: %s", ErrDuplicateSigner, signerPubKeyHex)
+        }
 
-		if !ecdsa.VerifyASN1(publicKeyObj, txHash, signerInfo.Signature) {
-			return false, fmt.Errorf("invalid signature for signer %d (pubkey: %x)", i, signerInfo.PublicKey)
-		}
+        // 3. Verify the signature
+        x, y := elliptic.Unmarshal(elliptic.P256(), signerInfo.PublicKey)
+        if x == nil || y == nil {
+            return false, fmt.Errorf("%w: failed to unmarshal public key for signer %d (pubkey: %x)", ErrPublicKeyMissingOrInvalid, i, signerInfo.PublicKey)
+        }
+        publicKeyObj := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
 
-		validSignerPubKeys[signerPubKeyHex] = true
-	}
+        if !ecdsa.VerifyASN1(publicKeyObj, txHash, signerInfo.Signature) {
+            return false, fmt.Errorf("%w: invalid signature for signer %d (pubkey: %x)", ErrSignatureMissingOrInvalid, i, signerInfo.PublicKey)
+        }
 
-	// 4. Ensure the number of unique valid signatures meets the M requirement
-	if uint32(len(validSignerPubKeys)) < tx.RequiredSignatures {
-		// This check is technically redundant if the outer loop iterates over tx.Signers
-		// and len(tx.Signers) was already checked against tx.RequiredSignatures,
-		// AND we ensure no duplicate signers. If tx.Signers could have more than M entries
-		// (e.g. more than required people signed), then this final count is important.
-		// Assuming tx.Signers will have at most N entries, and we need at least M valid ones.
-		return false, fmt.Errorf("sufficient number of valid signatures not met: have %d, require %d", len(validSignerPubKeys), tx.RequiredSignatures)
-	}
+        validSignerPubKeys[signerPubKeyHex] = true // Mark this public key as having provided a valid signature
+    }
 
-	// TODO: Verify the multi-sig identifier in tx.From matches the configuration
-	// This requires deriving the address from tx.RequiredSignatures and tx.AuthorizedPublicKeys
-	// and comparing it to tx.From. This function should be available from where address derivation is defined.
-	// For now, skipping this direct check here, assuming it's done at a higher level or implicitly.
+    // 4. Final check: Ensure the number of unique valid signatures meets the M requirement
+    if uint32(len(validSignerPubKeys)) < tx.RequiredSignatures {
+        return false, fmt.Errorf("%w: sufficient number of unique valid signatures not met: have %d, require %d", ErrNotEnoughSigners, len(validSignerPubKeys), tx.RequiredSignatures)
+    }
 
-	return true, nil
+    // TODO: Verify the multi-sig identifier in tx.From matches the derived multi-sig address
+    // This is a complex check that requires the multi-sig address derivation function,
+    // which would typically reside in a separate address utility package.
+    // This check is crucial for full multi-sig integrity but is deferred from this Tx verification scope.
+
+    return true, nil
 }
 
 
-// Helper to get string representation of addresses (optional, for logging/display)
-func (tx *Transaction) FromAddressString() string {
-	return hex.EncodeToString(tx.From)
+// --- Helper Functions (General Utilities) ---
+
+// encodeInt64 converts an int64 to a byte slice using binary.BigEndian encoding.
+// It panics only if an unexpected error occurs during encoding, which should not happen for int64.
+func encodeInt64(num int64) []byte {
+    buf := new(bytes.Buffer)
+    err := binary.Write(buf, binary.BigEndian, num)
+    if err != nil {
+        panic(fmt.Sprintf("CORE_UTIL_PANIC: failed to encode int64: %v", err)) 
+    }
+    return buf.Bytes()
 }
 
-func (tx *Transaction) ToAddressString() string {
-	return hex.EncodeToString(tx.To)
+// --- Address and Key Utility Functions (Conceptual/Placeholder) ---
+// These would typically live in a separate 'address' or 'crypto_util' package.
+// Included here conceptually to show how parts interact for full understanding.
+
+// GenerateKeyPairECDSA generates a new ECDSA private/public key pair (P256 curve).
+func GenerateKeyPairECDSA() (*ecdsa.PrivateKey, error) {
+    privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate ECDSA key pair: %w", err)
+    }
+    return privKey, nil
 }
 
-// Serialize serializes the transaction using gob.
+// PublicKeyToAddress derives a simplified address from an ECDSA public key.
+// In a real blockchain, this would involve hashing the public key (e.g., SHA256 then RIPEMD160)
+// and adding a version byte and checksum.
+func PublicKeyToAddress(pubKey *ecdsa.PublicKey) []byte {
+    pubKeyBytes := elliptic.Marshal(pubKey.Curve, pubKey.X, pubKey.Y)
+    // For simplicity, return the raw public key bytes as the address for now.
+    // In production, this would be a hashed, checksummed address.
+    return pubKeyBytes
+}
+
+// AddressFromPubKeyBytes (conceptual) reconstructs a PublicKey from address bytes (if address is raw pubkey)
+func AddressFromPubKeyBytes(addrBytes []byte) (*ecdsa.PublicKey, error) {
+	x, y := elliptic.Unmarshal(elliptic.P256(), addrBytes)
+	if x == nil || y == nil {
+		return nil, ErrPublicKeyMissingOrInvalid
+	}
+	return &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}, nil
+}
+
+// --- Serialization and Deserialization (GOB for internal, JSON for canonical hashing) ---
+
+// Serialize serializes the entire Transaction struct using gob for efficient binary storage.
 func (tx *Transaction) Serialize() ([]byte, error) {
-	var buf bytes.Buffer
-	encoder := gob.NewEncoder(&buf)
-	if err := encoder.Encode(tx); err != nil {
-		return nil, fmt.Errorf("failed to serialize transaction: %w", err)
-	}
-	return buf.Bytes(), nil
+    var buf bytes.Buffer
+    encoder := gob.NewEncoder(&buf)
+    if err := encoder.Encode(tx); err != nil {
+        return nil, fmt.Errorf("%w: failed to serialize transaction: %v", ErrTransactionSerialization, err)
+    }
+    return buf.Bytes(), nil
 }
 
 // DeserializeTransaction deserializes bytes into a Transaction using gob.
 func DeserializeTransaction(data []byte) (*Transaction, error) {
-	var tx Transaction
-	decoder := gob.NewDecoder(bytes.NewReader(data))
-	if err := decoder.Decode(&tx); err != nil {
-		return nil, fmt.Errorf("failed to deserialize transaction: %w", err)
-	}
-	return &tx, nil
+    var tx Transaction
+    decoder := gob.NewDecoder(bytes.NewReader(data))
+    if err := decoder.Decode(&tx); err != nil {
+        return nil, fmt.Errorf("%w: failed to deserialize transaction: %v", ErrTransactionDeserialization, err)
+    }
+    // Re-calculate ID after deserialization to ensure integrity (optional, can be done at validation)
+    // tx.ID, _ = tx.Hash()
+    return &tx, nil
 }

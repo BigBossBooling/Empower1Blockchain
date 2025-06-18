@@ -1,144 +1,259 @@
-package consensus
+package core
 
 import (
-	"empower1.com/core/internal/core"
+	"bytes"
+	"crypto/sha256"
+	"errors" // Explicitly import errors
 	"fmt"
-	"sort"
+	"log"    // For structured logging
+	"os"     // For log output
 	"sync"
+	// "encoding/hex" // For debugging addresses
 )
 
-// ConsensusState holds the current state relevant to the consensus process.
-type ConsensusState struct {
-	mu              sync.RWMutex
-	currentHeight   int64
-	validatorSet    []*Validator
-	proposerSchedule map[int64]*Validator // Maps height to the selected proposer for that height
-	// In a more complex system, this might include:
-	// - Current round/step
-	// - Votes received for the current block proposal
-	// - Information about locked blocks or quorums
+// --- Custom Errors for State Manager ---
+var (
+	ErrStateInit              = errors.New("state manager initialization error")
+	ErrInsufficientBalance    = errors.New("insufficient balance")
+	ErrUTXONotFound           = errors.New("utxo not found")
+	ErrUTXOAlreadySpent       = errors.New("utxo already spent")
+	ErrInvalidTransactionType = errors.New("invalid transaction type for state update")
+	ErrStateCorruption        = errors.New("blockchain state corrupted")
+	ErrWealthLevelNotFound    = errors.New("wealth level not found for address") // EmPower1 specific
+)
+
+// UTXO represents an unspent transaction output.
+// This is a fundamental component for UTXO-based blockchains.
+type UTXO struct {
+	TxID    []byte // The ID of the transaction that created this output
+	Vout    int    // The index of the output in that transaction
+	Value   uint64 // The amount of value in this output
+	Address []byte // The recipient's public key hash (address)
 }
 
-// NewConsensusState creates a new ConsensusState.
-func NewConsensusState() *ConsensusState {
-	return &ConsensusState{
-		currentHeight:   0, // Assuming 0 for genesis, will be updated with new blocks
-		validatorSet:    make([]*Validator, 0),
-		proposerSchedule: make(map[int64]*Validator),
+// Account represents the state associated with an address.
+// EmPower1: This is crucial for storing AI-assessed wealth levels.
+type Account struct {
+	Balance    uint64            // Current total balance from UTXOs
+	Nonce      uint64            // Transaction nonce (for account-based models or replay protection)
+	WealthLevel map[string]string // AI/ML assessed wealth level (e.g., {"category": "affluent", "last_updated": "timestamp"})
+	// V2+: ReputationScore float64 // Derived from on-chain behavior
+	// V2+: DID            []byte // Decentralized Identifier
+}
+
+// State manages the global, synchronized state of the EmPower1 Blockchain.
+// For V1, this is an in-memory UTXO set manager with conceptual Account states.
+// In a production system, this would be backed by persistent storage (e.g., LevelDB, RocksDB).
+type State struct {
+	mu           sync.RWMutex                     // Mutex for concurrent access
+	utxoSet      map[string]*UTXO                 // UTXO set: maps UTXO ID (TxID:Vout) to UTXO object
+	accounts     map[string]*Account              // Account states: maps address (hex) to Account object
+	logger       *log.Logger                      // Dedicated logger for the State instance
+}
+
+// NewState creates a new State manager.
+// Initializes the in-memory state storage.
+func NewState() (*State, error) {
+	logger := log.New(os.Stdout, "STATE: ", log.Ldate|log.Ltime|log.Lshortfile)
+	state := &State{
+		utxoSet:  make(map[string]*UTXO),
+		accounts: make(map[string]*Account), // Initialize account map
+		logger:   logger,
 	}
+	state.logger.Println("State manager initialized.")
+	return state, nil
 }
 
-// LoadInitialValidators loads the initial set of validators.
-// For now, this is a hardcoded list. Later, it could come from a config file or genesis state.
-func (cs *ConsensusState) LoadInitialValidators(validators []*Validator) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	cs.validatorSet = make([]*Validator, len(validators))
-	copy(cs.validatorSet, validators)
-	// Sort validators by address for deterministic proposer selection (if not weighted by stake)
-	sort.Slice(cs.validatorSet, func(i, j int) bool {
-		return cs.validatorSet[i].Address < cs.validatorSet[j].Address
-	})
-	cs.recalculateProposerSchedule(cs.currentHeight + 1, 10) // Pre-calculate for next 10 heights
-	fmt.Printf("ConsensusState: Initial validator set loaded. Count: %d\n", len(cs.validatorSet))
-}
+// UpdateStateFromBlock updates the blockchain state based on the transactions within a new, valid block.
+// This is the core state transition function, called by the blockchain after a block is added.
+// It directly supports "Systematize for Scalability, Synchronize for Synergy".
+func (s *State) UpdateStateFromBlock(block *Block) error {
+	s.mu.Lock() // Acquire write lock for state modification
+	defer s.mu.Unlock()
 
-// GetValidatorSet returns a copy of the current validator set.
-func (cs *ConsensusState) GetValidatorSet() []*Validator {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	setCopy := make([]*Validator, len(cs.validatorSet))
-	copy(setCopy, cs.validatorSet)
-	return setCopy
-}
+	s.logger.Printf("STATE: Updating state from block #%d (%x)", block.Height, block.Hash)
 
-// UpdateHeight updates the current block height.
-// This should be called when a new block is successfully added to the chain.
-func (cs *ConsensusState) UpdateHeight(newHeight int64) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	if newHeight > cs.currentHeight {
-		cs.currentHeight = newHeight
-		// Potentially recalculate proposer schedule or other height-dependent state
-		// For simplicity, we might pre-calculate or do it on demand.
-		// Pre-calculate for next 10 heights if current one is met
-		if cs.proposerSchedule[newHeight] != nil && cs.proposerSchedule[newHeight+1] == nil {
-			cs.recalculateProposerSchedule(newHeight+1, 10)
-		}
-	}
-}
-
-// CurrentHeight returns the current block height known by the consensus state.
-func (cs *ConsensusState) CurrentHeight() int64 {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	return cs.currentHeight
-}
-
-// recalculateProposerSchedule determines proposers for future heights (round-robin for now).
-// This is an internal method and should be called with the main lock held.
-func (cs *ConsensusState) recalculateProposerSchedule(startHeight int64, numHeights int) {
-	if len(cs.validatorSet) == 0 {
-		fmt.Println("ConsensusState: No validators available to schedule proposers.")
-		return
-	}
-	// Simple round-robin selection based on the sorted validator set
-	for i := 0; i < numHeights; i++ {
-		height := startHeight + int64(i)
-		if cs.proposerSchedule[height] == nil { // Only if not already scheduled
-			proposerIndex := (height - 1) % int64(len(cs.validatorSet)) // -1 because height 1 is first block
-			cs.proposerSchedule[height] = cs.validatorSet[proposerIndex]
-			// fmt.Printf("ConsensusState: Proposer for height %d scheduled: %s\n", height, cs.validatorSet[proposerIndex].Address)
-		}
-	}
-}
-
-// GetProposerForHeight returns the designated proposer for a given block height.
-// It recalculates the schedule if the requested height is beyond the current schedule.
-func (cs *ConsensusState) GetProposerForHeight(height int64) (*Validator, error) {
-	cs.mu.Lock() // Lock for potential recalculation
-	defer cs.mu.Unlock()
-
-	if len(cs.validatorSet) == 0 {
-		return nil, fmt.Errorf("no validators in set to determine proposer")
-	}
-
-	proposer, scheduled := cs.proposerSchedule[height]
-	if !scheduled {
-		// If not scheduled, calculate up to this height + a buffer
-		// This handles cases where we jump ahead or need a proposer for a future height not yet cached.
-		// The startHeight for recalculation should be the next height for which a proposer isn't scheduled.
-		// For simplicity, we'll try to schedule from current known height up to requested height + buffer.
-		// A more robust way would find the lowest height > currentHeight that lacks a proposer.
-		recalcStartHeight := cs.currentHeight + 1
-		if height > recalcStartHeight { // Only if the requested height is in the future
-			 cs.recalculateProposerSchedule(recalcStartHeight, int(height-recalcStartHeight+10))
-		} else { // If requesting current or past height (should ideally be scheduled)
-			 cs.recalculateProposerSchedule(height, 10) // Ensure at least this and a few more are scheduled
+	// Process each transaction in the block
+	for i, tx := range block.Transactions {
+		txIDHex := hex.EncodeToString(tx.ID)
+		
+		// 1. Process Inputs (Remove Spent UTXOs)
+		// For standard transactions, mark inputs as spent.
+		if tx.TxType == StandardTx || tx.TxType == TxContractCall || tx.TxType == TxContractDeploy {
+			for inputIdx, input := range tx.Inputs {
+				utxoKey := fmt.Sprintf("%x:%d", input.TxID, input.Vout)
+				if _, exists := s.utxoSet[utxoKey]; !exists {
+					// This indicates a double-spend or invalid UTXO reference, a critical error.
+					s.logger.Errorf("STATE_ERROR: Block %d, Tx %s: Input %d (%s) UTXO not found in state. Possible double-spend or invalid block.",
+						block.Height, txIDHex, inputIdx, utxoKey)
+					return fmt.Errorf("%w: input UTXO %s not found for tx %s in block %d", ErrUTXONotFound, utxoKey, txIDHex, block.Height)
+				}
+				// Conceptually: Verify input signature and pubkey against UTXO.Address
+				// This should ideally happen in tx.VerifySignature or a pre-validation, but double-check here.
+				
+				delete(s.utxoSet, utxoKey) // Mark UTXO as spent
+				s.logger.Debugf("STATE: Removed spent UTXO %s for tx %s", utxoKey, txIDHex)
+			}
 		}
 
-
-		proposer, scheduled = cs.proposerSchedule[height]
-		if !scheduled {
-			// This should ideally not happen if recalculateProposerSchedule works correctly with validators
-			return nil, fmt.Errorf("failed to determine proposer for height %d even after trying to schedule", height)
+		// 2. Process Outputs (Add New UTXOs)
+		for outputIdx, output := range tx.Outputs {
+			utxoKey := fmt.Sprintf("%x:%d", tx.ID, outputIdx)
+			if _, exists := s.utxoSet[utxoKey]; exists {
+				// This indicates a duplicate output being added, a critical error.
+				s.logger.Errorf("STATE_ERROR: Block %d, Tx %s: Output %d (%s) already exists in state. Possible tx ID collision or state corruption.",
+					block.Height, txIDHex, outputIdx, utxoKey)
+				return fmt.Errorf("%w: output UTXO %s already exists for tx %s in block %d", ErrUTXOAlreadySpent, utxoKey, txIDHex, block.Height)
+			}
+			newUTXO := &UTXO{
+				TxID:    tx.ID,
+				Vout:    outputIdx,
+				Value:   output.Value,
+				Address: output.PubKeyHash,
+			}
+			s.utxoSet[utxoKey] = newUTXO
+			s.logger.Debugf("STATE: Added new UTXO %s for tx %s, value %d to %x", utxoKey, txIDHex, output.Value, output.PubKeyHash)
+			
+			// Update conceptual account balance based on new UTXO
+			s.updateAccountBalance(output.PubKeyHash, output.Value)
 		}
+		
+		// 3. EmPower1 Specific: AI/ML Driven State Updates (Wealth Gap Redistribution)
+		// This is where the core mission of EmPower1 manifests in state.
+		// It assumes AI analysis has occurred and its directives are part of the block's AIAuditLog
+		// or directly embedded into stimulus/tax transactions.
+		if tx.TxType == StimulusTx || tx.TxType == TaxTx {
+			s.logger.Printf("STATE: Processing EmPower1 specific transaction Type: %s (ID: %s)", tx.TxType, txIDHex)
+			// Conceptual: Here, the state would update specific fields in accounts based on AI/ML analysis
+			// For example, update `Account.WealthLevel` for affected users based on the AI's latest assessment.
+			// This would involve looking up user addresses in tx.Inputs/Outputs and then updating their Account structs.
+			// This needs a robust connection to the AI/ML module's output for that block/tx.
+			// Example: if tx.Metadata contains {"ai_assessed_wealth_category": "affluent", "ai_trigger": "tax"}
+			// s.updateAccountWealthLevel(tx.From, tx.Metadata["ai_assessed_wealth_category"])
+			// s.logger.Printf("STATE: AI/ML driven state update for transaction %s. Type: %s", txIDHex, tx.TxType)
+		}
+
+		// 4. Update Account Nonce (for account-based transactions, conceptual for hybrid)
+		// If using a nonce for replay protection or ordering (account-based models)
+		// s.updateAccountNonce(tx.From, newNonceValue)
+
 	}
-	return proposer, nil
+	s.logger.Printf("STATE: State update from block #%d complete. Current UTXOs: %d", block.Height, len(s.utxoSet))
+	return nil
 }
 
-// SetCurrentBlock updates the consensus state based on the latest accepted block.
-// This would be called by the blockchain when a block is successfully added.
-func (cs *ConsensusState) SetCurrentBlock(block *core.Block) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	if block.Height > cs.currentHeight {
-		cs.currentHeight = block.Height
-		// If the new block's height means we need to schedule more proposers, do it.
-		// Check if the next height is already scheduled. If not, schedule more.
-		if cs.proposerSchedule[block.Height+1] == nil && len(cs.validatorSet) > 0 {
-			cs.recalculateProposerSchedule(block.Height+1, 10) // Schedule for the next 10 heights
+// updateAccountBalance conceptually updates an account's balance based on UTXO changes.
+// In a pure UTXO model, balances are always calculated by summing UTXOs.
+// This is a hybrid/conceptual step for convenience for EmPower1's account model.
+func (s *State) updateAccountBalance(address []byte, valueChange uint64) {
+	addrHex := hex.EncodeToString(address)
+	account, exists := s.accounts[addrHex]
+	if !exists {
+		account = &Account{
+			Balance:    0,
+			Nonce:      0,
+			WealthLevel: make(map[string]string), // Initialize empty
+		}
+		s.accounts[addrHex] = account
+	}
+	// This simple sum is conceptual. Actual UTXO sum is derived from walking the UTXOSet.
+	// For account-based model, this would be direct addition/subtraction.
+	account.Balance += valueChange 
+	// For deductions, you'd need to subtract. This method is oversimplified.
+	// In a true UTXO system, balance is recalculated by summing UTXOs belonging to the address.
+}
+
+// GetBalance returns the current confirmed balance for a given address.
+// In a pure UTXO model, this sums up all UTXOs belonging to the address.
+func (s *State) GetBalance(address []byte) (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	addrHex := hex.EncodeToString(address)
+	totalBalance := uint64(0)
+	found := false
+	
+	// Sum all UTXOs belonging to this address
+	for _, utxo := range s.utxoSet {
+		if bytes.Equal(utxo.Address, address) {
+			totalBalance += utxo.Value
+			found = true
 		}
 	}
-	// In a more complex system, we might update validator stakes, active sets, etc., based on block data.
+	
+	if !found {
+		return 0, ErrInsufficientBalance // Or a more specific "address not found" error
+	}
+	return totalBalance, nil
+}
+
+// FindSpendableOutputs finds and returns a list of UTXOs that can be spent by an address to cover an amount.
+// This is crucial for creating new transactions.
+func (s *State) FindSpendableOutputs(address []byte, amount uint64) ([]UTXO, uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	foundOutputs := []UTXO{}
+	accumulated := uint64(0)
+
+	// Iterate through UTXOs and select those belonging to the address until amount is met.
+	for _, utxo := range s.utxoSet {
+		if bytes.Equal(utxo.Address, address) {
+			foundOutputs = append(foundOutputs, *utxo) // Append a copy of the UTXO
+			accumulated += utxo.Value
+			if accumulated >= amount {
+				break
+			}
+		}
+	}
+
+	if accumulated < amount {
+		return nil, 0, ErrInsufficientBalance
+	}
+	return foundOutputs, accumulated, nil
+}
+
+// GetWealthLevel retrieves the conceptual AI/ML assessed wealth level for an address.
+// EmPower1 specific, leveraging AI/ML integration.
+func (s *State) GetWealthLevel(address []byte) (map[string]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	addrHex := hex.EncodeToString(address)
+	account, exists := s.accounts[addrHex]
+	if !exists || account.WealthLevel == nil || len(account.WealthLevel) == 0 {
+		return nil, ErrWealthLevelNotFound
+	}
+	// Return a copy to prevent external modification
+	wealthCopy := make(map[string]string)
+	for k, v := range account.WealthLevel {
+		wealthCopy[k] = v
+	}
+	return wealthCopy, nil
+}
+
+// UpdateWealthLevel is a conceptual function that would be called by the AI/ML module
+// or consensus logic to update an account's wealth level in state.
+// This simulates the direct integration of AI/ML insights into the blockchain state.
+func (s *State) UpdateWealthLevel(address []byte, level map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	addrHex := hex.EncodeToString(address)
+	account, exists := s.accounts[addrHex]
+	if !exists {
+		account = &Account{
+			Balance:     0,
+			Nonce:       0,
+			WealthLevel: make(map[string]string),
+		}
+		s.accounts[addrHex] = account
+	}
+	// Deep copy the map
+	account.WealthLevel = make(map[string]string)
+	for k, v := range level {
+		account.WealthLevel[k] = v
+	}
+	s.logger.Printf("STATE: Updated wealth level for %x: %v", address, level)
+	return nil
 }
