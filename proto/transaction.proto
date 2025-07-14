@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "empower1/internal/proto";
+
+message Transaction {
+  bytes from = 1;
+  bytes to = 2;
+  int64 amount = 3;
+  int64 fee = 4;
+  bytes signature = 5;
+}

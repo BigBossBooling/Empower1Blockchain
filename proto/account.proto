@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "empower1/internal/proto";
+
+message Account {
+  bytes address = 1;
+  int64 balance = 2;
+}
