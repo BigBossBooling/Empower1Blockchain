@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package empower1;
+
+option go_package = "github.com/empower1/empower1/proto";
+
+message Block {
+  bytes hash = 1;
+  bytes prev_hash = 2;
+  uint64 timestamp = 3;
+  repeated Transaction transactions = 4;
+  bytes validator = 5;
+}
+
+message Transaction {
+  bytes hash = 1;
+  repeated TxInput inputs = 2;
+  repeated TxOutput outputs = 3;
+}
+
+message TxInput {
+  bytes prev_tx_hash = 1;
+  uint32 output_index = 2;
+  bytes script_sig = 3;
+}
+
+message TxOutput {
+  uint64 value = 1;
+  bytes script_pub_key = 2;
+}
+
+message UTXO {
+  bytes tx_hash = 1;
+  uint32 output_index = 2;
+  TxOutput output = 3;
+}
+
+message Account {
+  bytes address = 1;
+  uint64 balance = 2;
+}
