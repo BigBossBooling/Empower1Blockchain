@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package proto;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/empower1/blockchain/proto";
+
+// Transaction represents a single transaction in the EmPower1 blockchain.
+message Transaction {
+    bytes hash = 1;
+    string from = 2;
+    string to = 3;
+    uint64 value = 4;
+    bytes data = 5;
+    google.protobuf.Timestamp timestamp = 6;
+}
+
+// BlockHeader contains the metadata for a block.
+message BlockHeader {
+    int32 version = 1;
+    bytes prev_block_hash = 2;
+    bytes transactions_hash = 3; // Merkle root of the transactions
+    google.protobuf.Timestamp timestamp = 4;
+    uint64 height = 5;
+}
+
+// Block represents a single block in the EmPower1 blockchain.
+message Block {
+    bytes hash = 1;
+    BlockHeader header = 2;
+    repeated Transaction transactions = 3;
+}
