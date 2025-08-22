@@ -57,13 +57,27 @@ message BlockMessage {
     Block block = 1;
 }
 
+// GetStatusMessage requests the status of a peer.
+message GetStatusMessage {}
+
+// StatusMessage is the response to a GetStatusMessage.
+message StatusMessage {
+    uint64 height = 1;
+}
+
+// GetBlocksMessage requests a range of blocks from a peer.
+message GetBlocksMessage {
+    uint64 from_height = 1;
+    uint64 to_height = 2;
+}
+
 // Message is a top-level wrapper for all P2P messages.
 // This allows for easy extension with new message types in the future.
 message Message {
     oneof payload {
         BlockMessage block = 1;
-        // Future message types can be added here, e.g.:
-        // TransactionMessage transaction = 2;
-        // GetStatusMessage get_status = 3;
+        GetStatusMessage get_status = 2;
+        StatusMessage status = 3;
+        GetBlocksMessage get_blocks = 4;
     }
 }

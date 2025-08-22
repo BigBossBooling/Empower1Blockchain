@@ -15,7 +15,12 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const oracleServerAddr = "localhost:4000"
+const (
+	p2pListenAddr    = ":3000"
+	oracleServerAddr = "localhost:4000"
+)
+
+var bootstrapNodes = []string{":3000"} // For now, it will try to sync with itself
 
 func main() {
 	fmt.Println("Starting EmPower1 Node...")
@@ -51,15 +56,23 @@ func main() {
 	}()
 
 	// 5. Start the P2P Server in a separate goroutine
-	server := network.NewServer(":3000", bc)
+	server := network.NewServer(p2pListenAddr, bc)
 	go func() {
 		if err := server.Start(); err != nil {
 			panic(err)
 		}
 	}()
 	fmt.Println("-> P2P Server starting...")
+	time.Sleep(100 * time.Millisecond) // Give the server a moment to start
 
-	// 6. Simulate the core block creation and broadcasting loop
+	// 6. Run initial chain synchronization
+	syncer := network.NewSyncer(bc, bootstrapNodes)
+	if err := syncer.Start(); err != nil {
+		// In a real app, this might be a fatal error depending on policy
+		log.Printf("Chain synchronization failed: %v", err)
+	}
+
+	// 7. Simulate the core block creation and broadcasting loop
 	fmt.Println("--> Entering block creation & broadcast simulation loop...")
 	for {
 		time.Sleep(5 * time.Second) // Wait for "block time"
@@ -67,46 +80,48 @@ func main() {
 		proposer := pos.NextProposer()
 		fmt.Printf("  [Height: %d] Next proposer: %s. Simulating block creation...\n", bc.Height(), proposer)
 
-		// Get the current head of the chain to link the new block
 		currentBlock, err := bc.GetBlockByHeight(bc.Height())
 		if err != nil {
 			log.Printf("Error getting current block: %v", err)
 			continue
 		}
 
-		// Create a new block
-		header := &pb.BlockHeader{
-			Version:       1,
-			PrevBlockHash: currentBlock.Block.Hash,
-			Height:        currentBlock.Header.Height + 1,
-			Timestamp:     timestamppb.New(time.Now()),
-		}
-		newBlock := core.NewBlock(header, []*pb.Transaction{})
-		newBlock.SetHash()
-
-		// Add the block to our own chain first
+		newBlock := createNewBlock(currentBlock)
 		if err := bc.AddBlock(newBlock); err != nil {
 			log.Printf("Error adding new block locally: %v", err)
 			continue
 		}
 
-		// Broadcast the new block to the network
-		go func(b *core.Block) {
-			msg := &pb.Message{
-				Payload: &pb.Message_Block{
-					Block: &pb.BlockMessage{Block: b.Block},
-				},
-			}
-			msgBytes, err := proto.Marshal(msg)
-			if err != nil {
-				log.Printf("Error marshalling block message: %v", err)
-				return
-			}
+		go broadcastBlock(server, newBlock)
+	}
+}
 
-			fmt.Printf("Broadcasting new block (Height: %d)\n", b.Header.Height)
-			if err := server.Broadcast(msgBytes); err != nil {
-				log.Printf("Error broadcasting block: %v", err)
-			}
-		}(newBlock)
+func createNewBlock(prevBlock *core.Block) *core.Block {
+	header := &pb.BlockHeader{
+		Version:       1,
+		PrevBlockHash: prevBlock.Block.Hash,
+		Height:        prevBlock.Header.Height + 1,
+		Timestamp:     timestamppb.New(time.Now()),
+	}
+	newBlock := core.NewBlock(header, []*pb.Transaction{})
+	newBlock.SetHash()
+	return newBlock
+}
+
+func broadcastBlock(s *network.Server, b *core.Block) {
+	msg := &pb.Message{
+		Payload: &pb.Message_Block{
+			Block: &pb.BlockMessage{Block: b.Block},
+		},
+	}
+	msgBytes, err := proto.Marshal(msg)
+	if err != nil {
+		log.Printf("Error marshalling block message: %v", err)
+		return
+	}
+
+	fmt.Printf("Broadcasting new block (Height: %d)\n", b.Header.Height)
+	if err := s.Broadcast(msgBytes); err != nil {
+		log.Printf("Error broadcasting block: %v", err)
 	}
 }

@@ -56,20 +56,21 @@ func (s *Server) Broadcast(msg []byte) error {
 	s.peerLock.RLock()
 	defer s.peerLock.RUnlock()
 
-	// Prepare the length-prefixed message
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(msg)))
-	fullMsg := append(lenBuf, msg...)
-
 	for addr, conn := range s.peers {
-		_, err := conn.Write(fullMsg)
-		if err != nil {
+		if err := s.send(conn, msg); err != nil {
 			fmt.Printf("Error sending message to peer %s: %v. Dropping connection.\n", addr, err)
-			// In a real implementation, we would handle this more gracefully,
-			// possibly removing the peer from the list.
+			// In a real implementation, we would handle this more gracefully.
 		}
 	}
 	return nil
+}
+
+// send is a helper function to send a length-prefixed message to a connection.
+func (s *Server) send(conn net.Conn, msg []byte) error {
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(msg)))
+	_, err := conn.Write(append(lenBuf, msg...))
+	return err
 }
 
 // handleConn manages a single incoming peer connection.
@@ -89,7 +90,6 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	fmt.Printf("New peer connected: %s\n", peerAddr)
 
-	// Loop to read and handle messages from the peer
 	for {
 		lenBuf := make([]byte, 4)
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
@@ -114,19 +114,60 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		if err := s.handleMessage(msg); err != nil {
+		if err := s.handleMessage(conn, msg); err != nil {
 			fmt.Printf("Error handling message from %s: %v\n", peerAddr, err)
 		}
 	}
 }
 
 // handleMessage dispatches incoming messages to the correct handler.
-func (s *Server) handleMessage(msg *pb.Message) error {
+func (s *Server) handleMessage(conn net.Conn, msg *pb.Message) error {
 	switch v := msg.Payload.(type) {
+	case *pb.Message_GetStatus:
+		fmt.Printf("Received GetStatus request from %s\n", conn.RemoteAddr())
+		statusMsg := &pb.Message{
+			Payload: &pb.Message_Status_{
+				Status_: &pb.StatusMessage{
+					Height: s.bc.Height(),
+				},
+			},
+		}
+		respBytes, err := proto.Marshal(statusMsg)
+		if err != nil {
+			return err
+		}
+		return s.send(conn, respBytes)
+
+	case *pb.Message_GetBlocks:
+		req := v.GetBlocks
+		fmt.Printf("Received GetBlocks request from %s for range %d-%d\n", conn.RemoteAddr(), req.FromHeight, req.ToHeight)
+		for i := req.FromHeight; i <= req.ToHeight; i++ {
+			block, err := s.bc.GetBlockByHeight(i)
+			if err != nil {
+				// Peer requested a block we don't have.
+				// In a real system, might send an error or just stop.
+				return err
+			}
+			blockMsg := &pb.Message{
+				Payload: &pb.Message_Block{
+					Block: &pb.BlockMessage{Block: block.Block},
+				},
+			}
+			respBytes, err := proto.Marshal(blockMsg)
+			if err != nil {
+				return err
+			}
+			if err := s.send(conn, respBytes); err != nil {
+				return fmt.Errorf("error sending block %d: %v", i, err)
+			}
+		}
+		return nil
+
 	case *pb.Message_Block:
 		block := v.Block.GetBlock()
-		fmt.Printf("Received new block message. Height: %d\n", block.Header.Height)
+		fmt.Printf("Received new block message from %s. Height: %d\n", conn.RemoteAddr(), block.Header.Height)
 		return s.bc.AddBlock(&core.Block{Block: block})
+
 	default:
 		return fmt.Errorf("received unknown message type: %T", v)
 	}
