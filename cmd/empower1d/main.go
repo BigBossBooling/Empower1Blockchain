@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"time"
@@ -25,9 +27,11 @@ var bootstrapNodes = []string{":3000"} // For now, it will try to sync with itse
 func main() {
 	fmt.Println("Starting EmPower1 Node...")
 
-	// 1. Initialize the Blockchain
+	// 1. Initialize core components
 	bc := core.NewBlockchain()
+	mempool := core.NewMempool()
 	fmt.Printf("-> Blockchain initialized. Current height: %d\n", bc.Height())
+	fmt.Println("-> Mempool initialized.")
 
 	// 2. Initialize the Consensus Engine
 	pos := consensus.NewPOS()
@@ -56,7 +60,7 @@ func main() {
 	}()
 
 	// 5. Start the P2P Server in a separate goroutine
-	server := network.NewServer(p2pListenAddr, bc)
+	server := network.NewServer(p2pListenAddr, bc, mempool)
 	go func() {
 		if err := server.Start(); err != nil {
 			panic(err)
@@ -68,7 +72,6 @@ func main() {
 	// 6. Run initial chain synchronization
 	syncer := network.NewSyncer(bc, bootstrapNodes)
 	if err := syncer.Start(); err != nil {
-		// In a real app, this might be a fatal error depending on policy
 		log.Printf("Chain synchronization failed: %v", err)
 	}
 
@@ -80,32 +83,70 @@ func main() {
 		proposer := pos.NextProposer()
 		fmt.Printf("  [Height: %d] Next proposer: %s. Simulating block creation...\n", bc.Height(), proposer)
 
+		// Get pending transactions from the mempool
+		pendingTxs := mempool.GetPending()
+		fmt.Printf("  Found %d pending transactions in mempool.\n", len(pendingTxs))
+
 		currentBlock, err := bc.GetBlockByHeight(bc.Height())
 		if err != nil {
 			log.Printf("Error getting current block: %v", err)
 			continue
 		}
 
-		newBlock := createNewBlock(currentBlock)
+		newBlock, err := createNewBlock(currentBlock, pendingTxs)
+		if err != nil {
+			log.Printf("Error creating new block: %v", err)
+			continue
+		}
+
 		if err := bc.AddBlock(newBlock); err != nil {
 			log.Printf("Error adding new block locally: %v", err)
 			continue
 		}
 
+		// Clear the mempool now that transactions are included in a block
+		mempool.Clear()
+
 		go broadcastBlock(server, newBlock)
 	}
 }
 
-func createNewBlock(prevBlock *core.Block) *core.Block {
-	header := &pb.BlockHeader{
-		Version:       1,
-		PrevBlockHash: prevBlock.Block.Hash,
-		Height:        prevBlock.Header.Height + 1,
-		Timestamp:     timestamppb.New(time.Now()),
+func createNewBlock(prevBlock *core.Block, txs []*pb.Transaction) (*core.Block, error) {
+	txsHash, err := calculateTxsHash(txs)
+	if err != nil {
+		return nil, err
 	}
-	newBlock := core.NewBlock(header, []*pb.Transaction{})
+
+	header := &pb.BlockHeader{
+		Version:          1,
+		PrevBlockHash:    prevBlock.Block.Hash,
+		TransactionsHash: txsHash,
+		Height:           prevBlock.Header.Height + 1,
+		Timestamp:        timestamppb.New(time.Now()),
+	}
+	newBlock := core.NewBlock(header, txs)
 	newBlock.SetHash()
-	return newBlock
+	return newBlock, nil
+}
+
+// calculateTxsHash is a placeholder for a proper Merkle root calculation.
+func calculateTxsHash(txs []*pb.Transaction) ([]byte, error) {
+	if len(txs) == 0 {
+		return make([]byte, 32), nil
+	}
+	// Simple approach: concatenate all tx hashes and hash the result.
+	var txHashes [][]byte
+	for _, tx := range txs {
+		txBytes, err := proto.Marshal(tx)
+		if err != nil {
+			return nil, err
+		}
+		hash := sha256.Sum256(txBytes)
+		txHashes = append(txHashes, hash[:])
+	}
+	combined := bytes.Join(txHashes, []byte{})
+	finalHash := sha256.Sum256(combined)
+	return finalHash[:], nil
 }
 
 func broadcastBlock(s *network.Server, b *core.Block) {
@@ -120,7 +161,7 @@ func broadcastBlock(s *network.Server, b *core.Block) {
 		return
 	}
 
-	fmt.Printf("Broadcasting new block (Height: %d)\n", b.Header.Height)
+	fmt.Printf("Broadcasting new block (Height: %d) with %d transactions\n", b.Header.Height, len(b.Transactions))
 	if err := s.Broadcast(msgBytes); err != nil {
 		log.Printf("Error broadcasting block: %v", err)
 	}

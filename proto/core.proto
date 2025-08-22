@@ -71,6 +71,11 @@ message GetBlocksMessage {
     uint64 to_height = 2;
 }
 
+// TransactionMessage is used to send a single transaction over the network.
+message TransactionMessage {
+    Transaction transaction = 1;
+}
+
 // Message is a top-level wrapper for all P2P messages.
 // This allows for easy extension with new message types in the future.
 message Message {
@@ -79,5 +84,6 @@ message Message {
         GetStatusMessage get_status = 2;
         StatusMessage status = 3;
         GetBlocksMessage get_blocks = 4;
+        TransactionMessage transaction = 5;
     }
 }
