@@ -31,3 +31,19 @@ message Block {
     BlockHeader header = 2;
     repeated Transaction transactions = 3;
 }
+
+// WealthScoreRecord holds a user's wealth/needs score.
+message WealthScoreRecord {
+    string user_id = 1; // User's Decentralized Identifier (DID)
+    double score = 2;
+    google.protobuf.Timestamp updated_at = 3;
+}
+
+// GetWealthScoresRequest is the request message for the GetWealthScores RPC.
+message GetWealthScoresRequest {}
+
+// OracleService defines the gRPC service for the off-chain Wealth Oracle.
+service OracleService {
+    // GetWealthScores streams the latest wealth scores from the oracle.
+    rpc GetWealthScores(GetWealthScoresRequest) returns (stream WealthScoreRecord);
+}
