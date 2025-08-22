@@ -47,3 +47,23 @@ service OracleService {
     // GetWealthScores streams the latest wealth scores from the oracle.
     rpc GetWealthScores(GetWealthScoresRequest) returns (stream WealthScoreRecord);
 }
+
+// ==============================================================================
+// P2P Messages
+// ==============================================================================
+
+// BlockMessage is used to send a full block over the network.
+message BlockMessage {
+    Block block = 1;
+}
+
+// Message is a top-level wrapper for all P2P messages.
+// This allows for easy extension with new message types in the future.
+message Message {
+    oneof payload {
+        BlockMessage block = 1;
+        // Future message types can be added here, e.g.:
+        // TransactionMessage transaction = 2;
+        // GetStatusMessage get_status = 3;
+    }
+}

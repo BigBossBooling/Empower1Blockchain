@@ -356,6 +356,123 @@ func (*GetWealthScoresRequest) Descriptor() ([]byte, []int) {
 	return file_proto_core_proto_rawDescGZIP(), []int{4}
 }
 
+// BlockMessage is used to send a full block over the network.
+type BlockMessage struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Block *Block `protobuf:"bytes,1,opt,name=block,proto3" json:"block,omitempty"`
+}
+
+func (x *BlockMessage) Reset() {
+	*x = BlockMessage{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_proto_core_proto_msgTypes[5]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *BlockMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BlockMessage) ProtoMessage() {}
+
+func (x *BlockMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_core_proto_msgTypes[5]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BlockMessage.ProtoReflect.Descriptor instead.
+func (*BlockMessage) Descriptor() ([]byte, []int) {
+	return file_proto_core_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *BlockMessage) GetBlock() *Block {
+	if x != nil {
+		return x.Block
+	}
+	return nil
+}
+
+// Message is a top-level wrapper for all P2P messages.
+// This allows for easy extension with new message types in the future.
+type Message struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	// Types that are assignable to Payload:
+	//
+	//	*Message_Block
+	Payload isMessage_Payload `protobuf_oneof:"payload"`
+}
+
+func (x *Message) Reset() {
+	*x = Message{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_proto_core_proto_msgTypes[6]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *Message) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Message) ProtoMessage() {}
+
+func (x *Message) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_core_proto_msgTypes[6]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Message.ProtoReflect.Descriptor instead.
+func (*Message) Descriptor() ([]byte, []int) {
+	return file_proto_core_proto_rawDescGZIP(), []int{6}
+}
+
+func (m *Message) GetPayload() isMessage_Payload {
+	if m != nil {
+		return m.Payload
+	}
+	return nil
+}
+
+func (x *Message) GetBlock() *BlockMessage {
+	if x, ok := x.GetPayload().(*Message_Block); ok {
+		return x.Block
+	}
+	return nil
+}
+
+type isMessage_Payload interface {
+	isMessage_Payload()
+}
+
+type Message_Block struct {
+	Block *BlockMessage `protobuf:"bytes,1,opt,name=block,proto3,oneof"`
+}
+
+func (*Message_Block) isMessage_Payload() {}
+
 var File_proto_core_proto protoreflect.FileDescriptor
 
 var file_proto_core_proto_rawDesc = []byte{
@@ -404,15 +521,23 @@ var file_proto_core_proto_rawDesc = []byte{
 	0x75, 0x66, 0x2e, 0x54, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70, 0x52, 0x09, 0x75, 0x70,
 	0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74, 0x22, 0x18, 0x0a, 0x16, 0x47, 0x65, 0x74, 0x57, 0x65,
 	0x61, 0x6c, 0x74, 0x68, 0x53, 0x63, 0x6f, 0x72, 0x65, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
-	0x74, 0x32, 0x5d, 0x0a, 0x0d, 0x4f, 0x72, 0x61, 0x63, 0x6c, 0x65, 0x53, 0x65, 0x72, 0x76, 0x69,
-	0x63, 0x65, 0x12, 0x4c, 0x0a, 0x0f, 0x47, 0x65, 0x74, 0x57, 0x65, 0x61, 0x6c, 0x74, 0x68, 0x53,
-	0x63, 0x6f, 0x72, 0x65, 0x73, 0x12, 0x1d, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x47, 0x65,
-	0x74, 0x57, 0x65, 0x61, 0x6c, 0x74, 0x68, 0x53, 0x63, 0x6f, 0x72, 0x65, 0x73, 0x52, 0x65, 0x71,
-	0x75, 0x65, 0x73, 0x74, 0x1a, 0x18, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x57, 0x65, 0x61,
-	0x6c, 0x74, 0x68, 0x53, 0x63, 0x6f, 0x72, 0x65, 0x52, 0x65, 0x63, 0x6f, 0x72, 0x64, 0x30, 0x01,
-	0x42, 0x26, 0x5a, 0x24, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x65,
-	0x6d, 0x70, 0x6f, 0x77, 0x65, 0x72, 0x31, 0x2f, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x63, 0x68, 0x61,
-	0x69, 0x6e, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+	0x74, 0x22, 0x32, 0x0a, 0x0c, 0x42, 0x6c, 0x6f, 0x63, 0x6b, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67,
+	0x65, 0x12, 0x22, 0x0a, 0x05, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b,
+	0x32, 0x0c, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x42, 0x6c, 0x6f, 0x63, 0x6b, 0x52, 0x05,
+	0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x22, 0x41, 0x0a, 0x07, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65,
+	0x12, 0x2b, 0x0a, 0x05, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32,
+	0x13, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x42, 0x6c, 0x6f, 0x63, 0x6b, 0x4d, 0x65, 0x73,
+	0x73, 0x61, 0x67, 0x65, 0x48, 0x00, 0x52, 0x05, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x42, 0x09, 0x0a,
+	0x07, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x32, 0x5d, 0x0a, 0x0d, 0x4f, 0x72, 0x61, 0x63,
+	0x6c, 0x65, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x4c, 0x0a, 0x0f, 0x47, 0x65, 0x74,
+	0x57, 0x65, 0x61, 0x6c, 0x74, 0x68, 0x53, 0x63, 0x6f, 0x72, 0x65, 0x73, 0x12, 0x1d, 0x2e, 0x70,
+	0x72, 0x6f, 0x74, 0x6f, 0x2e, 0x47, 0x65, 0x74, 0x57, 0x65, 0x61, 0x6c, 0x74, 0x68, 0x53, 0x63,
+	0x6f, 0x72, 0x65, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x18, 0x2e, 0x70, 0x72,
+	0x6f, 0x74, 0x6f, 0x2e, 0x57, 0x65, 0x61, 0x6c, 0x74, 0x68, 0x53, 0x63, 0x6f, 0x72, 0x65, 0x52,
+	0x65, 0x63, 0x6f, 0x72, 0x64, 0x30, 0x01, 0x42, 0x26, 0x5a, 0x24, 0x67, 0x69, 0x74, 0x68, 0x75,
+	0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x65, 0x6d, 0x70, 0x6f, 0x77, 0x65, 0x72, 0x31, 0x2f, 0x62,
+	0x6c, 0x6f, 0x63, 0x6b, 0x63, 0x68, 0x61, 0x69, 0x6e, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x62,
+	0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
 }
 
 var (
@@ -427,28 +552,32 @@ func file_proto_core_proto_rawDescGZIP() []byte {
 	return file_proto_core_proto_rawDescData
 }
 
-var file_proto_core_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_proto_core_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_proto_core_proto_goTypes = []interface{}{
 	(*Transaction)(nil),            // 0: proto.Transaction
 	(*BlockHeader)(nil),            // 1: proto.BlockHeader
 	(*Block)(nil),                  // 2: proto.Block
 	(*WealthScoreRecord)(nil),      // 3: proto.WealthScoreRecord
 	(*GetWealthScoresRequest)(nil), // 4: proto.GetWealthScoresRequest
-	(*timestamppb.Timestamp)(nil),  // 5: google.protobuf.Timestamp
+	(*BlockMessage)(nil),           // 5: proto.BlockMessage
+	(*Message)(nil),                // 6: proto.Message
+	(*timestamppb.Timestamp)(nil),  // 7: google.protobuf.Timestamp
 }
 var file_proto_core_proto_depIdxs = []int32{
-	5, // 0: proto.Transaction.timestamp:type_name -> google.protobuf.Timestamp
-	5, // 1: proto.BlockHeader.timestamp:type_name -> google.protobuf.Timestamp
+	7, // 0: proto.Transaction.timestamp:type_name -> google.protobuf.Timestamp
+	7, // 1: proto.BlockHeader.timestamp:type_name -> google.protobuf.Timestamp
 	1, // 2: proto.Block.header:type_name -> proto.BlockHeader
 	0, // 3: proto.Block.transactions:type_name -> proto.Transaction
-	5, // 4: proto.WealthScoreRecord.updated_at:type_name -> google.protobuf.Timestamp
-	4, // 5: proto.OracleService.GetWealthScores:input_type -> proto.GetWealthScoresRequest
-	3, // 6: proto.OracleService.GetWealthScores:output_type -> proto.WealthScoreRecord
-	6, // [6:7] is the sub-list for method output_type
-	5, // [5:6] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	7, // 4: proto.WealthScoreRecord.updated_at:type_name -> google.protobuf.Timestamp
+	2, // 5: proto.BlockMessage.block:type_name -> proto.Block
+	5, // 6: proto.Message.block:type_name -> proto.BlockMessage
+	4, // 7: proto.OracleService.GetWealthScores:input_type -> proto.GetWealthScoresRequest
+	3, // 8: proto.OracleService.GetWealthScores:output_type -> proto.WealthScoreRecord
+	8, // [8:9] is the sub-list for method output_type
+	7, // [7:8] is the sub-list for method input_type
+	7, // [7:7] is the sub-list for extension type_name
+	7, // [7:7] is the sub-list for extension extendee
+	0, // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_proto_core_proto_init() }
@@ -517,6 +646,33 @@ func file_proto_core_proto_init() {
 				return nil
 			}
 		}
+		file_proto_core_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*BlockMessage); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_proto_core_proto_msgTypes[6].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*Message); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+	}
+	file_proto_core_proto_msgTypes[6].OneofWrappers = []interface{}{
+		(*Message_Block)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -524,7 +680,7 @@ func file_proto_core_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_proto_core_proto_rawDesc,
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
