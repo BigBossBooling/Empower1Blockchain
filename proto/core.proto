@@ -23,6 +23,8 @@ message BlockHeader {
     bytes transactions_hash = 3; // Merkle root of the transactions
     google.protobuf.Timestamp timestamp = 4;
     uint64 height = 5;
+    string proposer_address = 6;
+    bytes signature = 7;
 }
 
 // Block represents a single block in the EmPower1 blockchain.

@@ -4,19 +4,22 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
+
+	"github.com/empower1/blockchain/internal/consensus"
 )
 
 // Blockchain represents the blockchain structure, holding all blocks.
-// For now, it's an in-memory structure.
 type Blockchain struct {
 	lock   sync.RWMutex
 	blocks []*Block
+	pos    *consensus.POS // The consensus engine
 }
 
 // NewBlockchain creates a new blockchain, initialized with the genesis block.
-func NewBlockchain() *Blockchain {
+func NewBlockchain(pos *consensus.POS) *Blockchain {
 	bc := &Blockchain{
 		blocks: []*Block{},
+		pos:    pos,
 	}
 	bc.blocks = append(bc.blocks, NewGenesisBlock())
 	return bc
@@ -63,7 +66,6 @@ func (bc *Blockchain) getBlockByHeight_nolock(height uint64) (*Block, error) {
 }
 
 // validateBlock_nolock performs a series of checks to ensure a block is valid before adding it.
-// This is the internal, non-locking version, assuming a write lock is already held.
 func (bc *Blockchain) validateBlock_nolock(b *Block) error {
 	// Get the current head of the chain
 	currentBlock, err := bc.getBlockByHeight_nolock(bc.height_nolock())
@@ -88,6 +90,21 @@ func (bc *Blockchain) validateBlock_nolock(b *Block) error {
 	}
 	if !bytes.Equal(hash, b.Block.Hash) {
 		return fmt.Errorf("invalid block hash: calculated hash does not match block's hash")
+	}
+
+	// Verify the block's signature
+	proposerAddress := b.Header.ProposerAddress
+	proposer := bc.pos.GetValidator(proposerAddress)
+	if proposer == nil {
+		return fmt.Errorf("validator not found for proposer address: %s", proposerAddress)
+	}
+
+	valid, err := b.VerifySignature(proposer.PublicKey)
+	if err != nil {
+		return fmt.Errorf("error verifying signature: %v", err)
+	}
+	if !valid {
+		return fmt.Errorf("invalid block signature")
 	}
 
 	return nil
